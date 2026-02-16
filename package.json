@@ -1,0 +1,11 @@
+{
+  "name": "wiz",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "wiz": "./wiz.ts"
+  },
+  "scripts": {
+    "start": "bun ./wiz"
+  }
+}

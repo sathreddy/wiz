@@ -1,0 +1,895 @@
+#!/usr/bin/env bun
+
+import { createSocket, type Socket, type RemoteInfo } from "node:dgram";
+import { networkInterfaces } from "node:os";
+import { readFileSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// -- load .env from script directory --
+
+const __dir = dirname(fileURLToPath(import.meta.url));
+try {
+  const envPath = resolve(__dir, ".env");
+  const envContent = readFileSync(envPath, "utf-8");
+  for (const line of envContent.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq > 0) process.env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+  }
+} catch {
+  console.error("\x1b[31m  missing .env file — copy env.example to .env and set WIZ_MAC\x1b[0m");
+  console.error(`\x1b[2m  cp ${resolve(__dir, "env.example")} ${resolve(__dir, ".env")}\x1b[0m`);
+  process.exit(1);
+}
+
+// -- types --
+
+interface WizPilotParams {
+  state?: boolean;
+  dimming?: number;
+  temp?: number;
+  r?: number;
+  g?: number;
+  b?: number;
+  w?: number;
+  c?: number;
+}
+
+interface WizPilotState {
+  state: boolean;
+  dimming: number;
+  temp?: number;
+  r?: number;
+  g?: number;
+  b?: number;
+  mac?: string;
+}
+
+interface WizResponse {
+  result?: WizPilotState & { success?: boolean; mac?: string };
+}
+
+type RGB = [number, number, number];
+
+interface Mode {
+  title: string;
+  params: WizPilotParams;
+  desc: string;
+  verify: (s: WizPilotState) => boolean;
+  tagline: string;
+}
+
+interface Shader {
+  render(t: number, w: number, h: number): string[];
+  color(x: number, y: number, ch: string, w: number, h: number): RGB;
+  successColor(ch: string): RGB;
+  headerColor: RGB;
+  titleColor: RGB;
+}
+
+interface Particle {
+  phase: number;
+  speed: number;
+  drift: number;
+  size: number;
+}
+
+// -- config --
+
+const WIZ_PORT = 38899;
+const WIZ_MAC = process.env.WIZ_MAC;
+
+if (!WIZ_MAC || WIZ_MAC === "your_bulb_mac_here") {
+  console.error("\x1b[31m  WIZ_MAC not set in .env\x1b[0m");
+  console.error("\x1b[2m  run: wiz discover  (not yet implemented)\x1b[0m");
+  process.exit(1);
+}
+const DISCOVERY_TIMEOUT_MS = 4000;
+const COMMAND_TIMEOUT_MS = 2000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 500;
+
+const MODES: Record<string, Mode> = {
+  movie: {
+    title: "m o v i e t i m e",
+    params: { state: true, dimming: 1, temp: 2200 },
+    desc: "1% brightness  ·  2200K warm white",
+    verify: (s) => s.state === true && s.dimming <= 2 && s.temp === 2200,
+    tagline: "enjoy the movie",
+  },
+  chill: {
+    title: "c h i l l t i m e",
+    params: { state: true, dimming: 40, temp: 2700 },
+    desc: "40% brightness  ·  2700K warm white",
+    verify: (s) => s.state === true && s.dimming >= 38 && s.dimming <= 42 && s.temp === 2700,
+    tagline: "time to unwind",
+  },
+  day: {
+    title: "d a y t i m e",
+    params: { state: true, dimming: 100, temp: 5000 },
+    desc: "100% brightness  ·  5000K daylight",
+    verify: (s) => s.state === true && s.dimming >= 98 && s.temp === 5000,
+    tagline: "let there be light",
+  },
+};
+
+// -- parse args --
+
+interface ParsedArgs {
+  modeName: string | null;
+  hexColor: string | null;
+  brightness: number | null;
+}
+
+function parseArgs(): ParsedArgs {
+  const args = process.argv.slice(2);
+  let modeName: string | null = null;
+  let hexColor: string | null = null;
+  let brightness: number | null = null;
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i].replace(/^-+/, "");
+
+    if (a in MODES) {
+      modeName = a;
+    } else if (a === "color" || a === "c") {
+      hexColor = args[++i];
+    } else if (a === "brightness" || a === "bright" || a === "b" || a === "dim") {
+      brightness = parseInt(args[++i], 10);
+    } else if (/^[0-9a-fA-F]{3,6}$/.test(a) || /^#[0-9a-fA-F]{3,6}$/.test(args[i])) {
+      hexColor = a.replace(/^#/, "");
+    } else if (/^\d+%?$/.test(a)) {
+      brightness = parseInt(a, 10);
+    }
+  }
+
+  if (hexColor) {
+    hexColor = hexColor.replace(/^#/, "");
+    if (hexColor.length === 3) hexColor = hexColor.split("").map(c => c + c).join("");
+    if (!/^[0-9a-fA-F]{6}$/.test(hexColor)) {
+      console.error(`\x1b[31m  invalid hex color: ${hexColor}\x1b[0m`);
+      process.exit(1);
+    }
+  }
+
+  if (brightness !== null && (isNaN(brightness) || brightness < 1 || brightness > 100)) {
+    console.error(`\x1b[31m  brightness must be 1-100\x1b[0m`);
+    process.exit(1);
+  }
+
+  if (!modeName && (hexColor || brightness !== null)) {
+    const r = hexColor ? parseInt(hexColor.slice(0, 2), 16) : null;
+    const g = hexColor ? parseInt(hexColor.slice(2, 4), 16) : null;
+    const b = hexColor ? parseInt(hexColor.slice(4, 6), 16) : null;
+    const dim = brightness ?? 100;
+
+    const params: WizPilotParams = { state: true, dimming: dim };
+    if (hexColor) {
+      params.r = r!; params.g = g!; params.b = b!; params.w = 0; params.c = 0;
+    }
+
+    const desc = hexColor
+      ? `${dim}% brightness  ·  rgb(${r}, ${g}, ${b})`
+      : `${dim}% brightness`;
+
+    MODES.custom = {
+      title: hexColor ? `# ${hexColor.toUpperCase()}` : `${dim} %`,
+      params,
+      desc,
+      verify: (s) => s.state === true,
+      tagline: "looking good",
+    };
+    return { modeName: "custom", hexColor, brightness };
+  }
+
+  if (modeName && brightness !== null) {
+    MODES[modeName] = {
+      ...MODES[modeName],
+      params: { ...MODES[modeName].params, dimming: brightness },
+      desc: MODES[modeName].desc.replace(/\d+% brightness/, `${brightness}% brightness`),
+    };
+  }
+
+  return { modeName, hexColor, brightness };
+}
+
+const { modeName: arg } = parseArgs();
+const mode = arg ? MODES[arg] : null;
+
+if (!mode) {
+  const c = (s: string) => `\x1b[33m${s}\x1b[0m`;
+  const d = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  console.log(`\n  ${c("wiz")} — control your wiz light\n`);
+  console.log(`  usage: wiz ${c("<mode>")} [options]\n`);
+  console.log(`  presets:`);
+  console.log(`    ${c("-movie")}          ${d("1% · 2200K  — pico projector darkness")}`);
+  console.log(`    ${c("-chill")}          ${d("40% · 2700K — warm evening ambiance")}`);
+  console.log(`    ${c("-day")}            ${d("100% · 5000K — bright daylight")}`);
+  console.log();
+  console.log(`  custom:`);
+  console.log(`    ${c("wiz ff6b35")}      ${d("set color by hex")}`);
+  console.log(`    ${c("wiz ff6b35 50")}   ${d("hex color at 50% brightness")}`);
+  console.log(`    ${c("wiz -b 75")}       ${d("set brightness only (1-100)")}`);
+  console.log(`    ${c("wiz -chill -b 60")}${d(" preset with brightness override")}`);
+  console.log();
+  process.exit(arg === "help" || arg === "h" ? 0 : 1);
+}
+
+// -- terminal --
+
+const cols = process.stdout.columns || 60;
+const W = Math.min(cols - 4, 62);
+const H = 14;
+const hide = "\x1b[?25l";
+const show = "\x1b[?25h";
+const up = (n: number) => `\x1b[${n}A`;
+const clr = "\x1b[2K";
+const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
+const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
+const rgb = (r: number, g: number, b: number, s: string) => `\x1b[38;2;${r};${g};${b}m${s}\x1b[0m`;
+
+// -- SDF toolkit --
+
+const ramp = " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
+const RL = ramp.length;
+const A = 2.0;
+
+function smoothstep(e0: number, e1: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+  return t * t * (3 - 2 * t);
+}
+
+function sdCircle(px: number, py: number, cx: number, cy: number, r: number): number {
+  const dx = (px - cx) * A, dy = py - cy;
+  return Math.sqrt(dx * dx + dy * dy) - r;
+}
+
+function sdBox(px: number, py: number, cx: number, cy: number, hw: number, hh: number): number {
+  const dx = Math.abs((px - cx) * A) - hw;
+  const dy = Math.abs(py - cy) - hh;
+  return Math.sqrt(Math.max(dx, 0) ** 2 + Math.max(dy, 0) ** 2) + Math.min(Math.max(dx, dy), 0);
+}
+
+function hash(x: number, y: number): number {
+  let h = (x * 73856093) ^ (y * 19349663);
+  h = ((h >> 16) ^ h) * 0x45d9f3b;
+  return ((h >> 16) ^ h) & 0x7fffffff;
+}
+
+function noise(x: number, y: number): number {
+  return (hash(Math.floor(x * 1000), Math.floor(y * 1000)) % 1000) / 1000;
+}
+
+function vnoise(x: number, y: number): number {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const n00 = noise(ix, iy), n10 = noise(ix + 1, iy);
+  const n01 = noise(ix, iy + 1), n11 = noise(ix + 1, iy + 1);
+  return n00 * (1 - sx) * (1 - sy) + n10 * sx * (1 - sy) + n01 * (1 - sx) * sy + n11 * sx * sy;
+}
+
+function sat(v: number): number { return Math.max(0, Math.min(1, v)); }
+function charFor(v: number): string { return ramp[Math.floor(sat(v) * (RL - 1))]; }
+function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
+
+// -- particles (shared pool) --
+
+const particles: Particle[] = Array.from({ length: 18 }, (_, i) => ({
+  phase: i * 0.7,
+  speed: 0.3 + (hash(i, 42) % 100) / 150,
+  drift: (hash(i, 77) % 100) / 100 - 0.5,
+  size: 0.01 + (hash(i, 99) % 100) / 3000,
+}));
+
+// ============================================================
+//  SHADERS
+// ============================================================
+
+const shaders: Record<string, Shader> = {
+  movie: {
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
+
+      const pEmber    = smoothstep(0.0, 1.2, t);
+      const pIgnite   = smoothstep(1.0, 2.0, t);
+      const pBeamGrow = smoothstep(1.8, 4.0, t);
+      const pScreen   = smoothstep(3.5, 5.0, t);
+      const pDust     = smoothstep(3.0, 5.5, t);
+      const pFilm     = smoothstep(4.5, 6.5, t);
+      const pSettle   = smoothstep(6.0, 8.0, t);
+      const pBulb     = smoothstep(5.0, 7.0, t);
+
+      const ox = -0.42, oy = 0.42;
+      const bx = 0.42, by = -0.92;
+      const bLen = Math.sqrt(bx * bx + by * by);
+      const bnx = bx / bLen, bny = by / bLen;
+
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+          let val = 0;
+
+          const emberDist = sdCircle(u, v, ox, oy, 0.015);
+          const emberThrob = 0.7 + 0.3 * Math.sin(t * 8);
+          const ember = smoothstep(0.04, -0.02, emberDist) * pEmber * emberThrob;
+          const emberHalo = smoothstep(0.12, -0.01, emberDist) * pEmber * 0.2;
+
+          const toU = u - ox, toV = v - oy;
+          const along = toU * bnx + toV * bny;
+          const perpU = toU - bnx * along, perpV = toV - bny * along;
+          const perp = Math.sqrt(perpU * perpU + perpV * perpV);
+
+          const beamReach = pIgnite * 0.3 + pBeamGrow * 0.75;
+          const reachMask = smoothstep(beamReach + 0.02, beamReach - 0.05, along)
+            * smoothstep(-0.02, 0.04, along);
+
+          const thinness = lerp(0.005, 0.04, pBeamGrow);
+          const spread = thinness + Math.max(0, along) * lerp(0.02, 0.35, pBeamGrow);
+          const beamEdge = smoothstep(spread, spread * 0.2, perp);
+
+          const beamCore = smoothstep(spread * 0.3, 0, perp) * 0.3;
+          const beam = (beamEdge * 0.55 + beamCore) * reachMask * pIgnite;
+
+          const lampFlicker = lerp(
+            0.6 + 0.4 * Math.sin(t * 15) * Math.sin(t * 23),
+            0.95 + 0.05 * Math.sin(t * 7),
+            pSettle
+          );
+
+          let dust = 0;
+          if (pDust > 0.01) {
+            for (const p of particles) {
+              const pt = t * p.speed + p.phase;
+              const prog = (pt % 1.4) / 1.4;
+              const px = ox + bx * prog + Math.sin(pt * 1.7) * p.drift * 0.12;
+              const py = oy + by * prog + Math.cos(pt * 2.3) * 0.04;
+              const dd = sdCircle(u, v, px, py, p.size);
+              dust += smoothstep(0.025, -0.005, dd) * 0.3;
+            }
+            dust *= pDust * beam;
+          }
+
+          const screenW = 0.28, screenH = 0.065;
+          const screenCy = -0.38;
+          const sDist = sdBox(u, v, 0, screenCy, screenW, screenH);
+
+          const irisR = pScreen * 0.45;
+          const irisDist = sdCircle(u, v, 0, screenCy, irisR);
+          const irisMask = smoothstep(0.02, -0.01, irisDist);
+
+          const sEdge = smoothstep(0.008, -0.004, sDist);
+          const sGlow = smoothstep(0.1, -0.01, sDist) * 0.4;
+          const screen = sEdge * irisMask * pScreen;
+          const screenGlow = sGlow * pScreen * 0.5;
+
+          const sFlk = lerp(1.0,
+            0.7 + 0.3 * (Math.sin(t * 7.3) * 0.5 + 0.5) * (Math.sin(t * 11.1) * 0.3 + 0.7),
+            pFilm);
+          const filmBand = (Math.sin((u + t * 0.15) * 25) * 0.15
+            + Math.sin((v + t * 0.08) * 40) * 0.1) * pFilm;
+
+          const bp = 0.5 + 0.5 * Math.sin(t * 2.2);
+          const bDist = sdCircle(u, v, 0, 0.48, 0.018 + bp * 0.006);
+          const bulbGlow = smoothstep(0.12, -0.01, bDist) * (0.2 + bp * 0.1) * pBulb;
+          const bulbCore = smoothstep(0.008, -0.008, bDist) * 0.5 * pBulb;
+          const bulbLight = Math.max(0, 1 - sdCircle(u, v, 0, 0.48, 0) / 0.45)
+            * 0.1 * (0.8 + bp * 0.2) * pBulb;
+
+          const scan = (Math.sin(v * h * 6.28 + t * 4) * 0.5 + 0.5) * 0.05 * pFilm;
+          const grain = (noise(u + t * 0.1, v + t * 0.07) - 0.5) * 0.07 * pFilm;
+
+          val += ember + emberHalo;
+          val += beam * lampFlicker;
+          val += dust;
+          val += screen * 0.7 * (sFlk + filmBand);
+          val += screenGlow * sFlk;
+          val += bulbGlow + bulbCore + bulbLight;
+          val += scan * beam;
+          val += grain * Math.max(beam, screen * 0.5);
+
+          row += charFor(Math.pow(sat(val), 0.85));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const u = x / w, v = y / h;
+      if (v < 0.15 && u > 0.2 && u < 0.8 && i > 0.1)
+        return [140 + i * 115 | 0, 150 + i * 105 | 0, 180 + i * 75 | 0];
+      if (v > 0.75 && u < 0.2)
+        return [200 + i * 55 | 0, 160 + i * 60 | 0, 80 + i * 40 | 0];
+      if (v > 0.8 && u > 0.35 && u < 0.65)
+        return [160 + i * 95 | 0, 100 + i * 70 | 0, 20 + i * 30 | 0];
+      if (i > 0.03)
+        return [110 + i * 145 | 0, 85 + i * 105 | 0, 40 + i * 55 | 0];
+      return [70 + i * 100 | 0, 60 + i * 80 | 0, 35 + i * 50 | 0];
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [180 + i * 75 | 0, 110 + i * 80 | 0, 20 + i * 40 | 0];
+    },
+    headerColor: [208, 140, 40],
+    titleColor: [255, 200, 60],
+  },
+
+  chill: {
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+
+          const b1x = Math.sin(t * 0.4) * 0.2, b1y = Math.cos(t * 0.35) * 0.25;
+          const b2x = Math.cos(t * 0.3 + 2) * 0.25, b2y = Math.sin(t * 0.45 + 1) * 0.2;
+          const b3x = Math.sin(t * 0.5 + 4) * 0.15, b3y = Math.cos(t * 0.25 + 3) * 0.3;
+
+          const d1 = sdCircle(u, v, b1x, b1y, 0.12 + Math.sin(t * 0.7) * 0.03);
+          const d2 = sdCircle(u, v, b2x, b2y, 0.1 + Math.cos(t * 0.6) * 0.02);
+          const d3 = sdCircle(u, v, b3x, b3y, 0.08 + Math.sin(t * 0.8 + 2) * 0.025);
+
+          const k = 0.15;
+          const h1 = sat(0.5 + 0.5 * (d2 - d1) / k);
+          const m12 = d1 * h1 + d2 * (1 - h1) - k * h1 * (1 - h1);
+          const h2 = sat(0.5 + 0.5 * (d3 - m12) / k);
+          const merged = m12 * h2 + d3 * (1 - h2) - k * h2 * (1 - h2);
+
+          const blobVal = smoothstep(0.06, -0.04, merged);
+          const blobEdge = smoothstep(0.02, -0.01, merged) * 0.3;
+
+          const warmth = smoothstep(0.5, -0.3, v) * 0.2;
+
+          const wave = (Math.sin(u * 8 + t * 0.8 + v * 4) * 0.5 + 0.5)
+            * (Math.cos(v * 6 - t * 0.5) * 0.5 + 0.5) * 0.15;
+
+          const flicker = vnoise(u * 3 + t * 0.5, v * 3 + t * 0.3) * 0.12;
+
+          const dist = Math.sqrt(u * u * 4 + v * v * 4);
+          const vignette = smoothstep(0.9, 0.3, dist);
+
+          let val = (blobVal * 0.6 + blobEdge + warmth + wave + flicker) * vignette;
+          row += charFor(Math.pow(sat(val), 0.75));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const v = y / h;
+      const r = lerp(160, 220, i) + v * -20 | 0;
+      const g = lerp(80, 140, i) + v * -30 | 0;
+      const b = lerp(50, 80, i) + v * -20 | 0;
+      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [180 + i * 60 | 0, 120 + i * 50 | 0, 50 + i * 30 | 0];
+    },
+    headerColor: [210, 130, 70],
+    titleColor: [255, 180, 100],
+  },
+
+  day: {
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+
+          const sunY = 0.25 - Math.sin(t * 0.3) * 0.05;
+          const sunDist = sdCircle(u, v, 0, sunY, 0.12);
+          const sunCore = smoothstep(0.01, -0.03, sunDist);
+          const sunGlow = smoothstep(0.25, -0.02, sunDist) * 0.5;
+
+          const angle = Math.atan2(v - sunY, u * A);
+          const rayCount = 12;
+          const rayAngle = ((angle / (2 * Math.PI)) * rayCount + t * 0.3) % 1;
+          const rayPattern = (Math.sin(rayAngle * Math.PI * 2) * 0.5 + 0.5);
+          const rayDist = Math.sqrt((u * A) ** 2 + (v - sunY) ** 2);
+          const rays = rayPattern * smoothstep(0.5, 0.08, rayDist) * smoothstep(0.04, 0.15, rayDist) * 0.35;
+
+          const sky = smoothstep(0.5, -0.4, v) * 0.18;
+
+          const cloud1x = u + t * 0.06;
+          const cloud1 = smoothstep(0.55, 0.65, vnoise(cloud1x * 3, v * 6))
+            * smoothstep(0.3, -0.1, v) * 0.25;
+          const cloud2x = u - t * 0.04 + 0.5;
+          const cloud2 = smoothstep(0.52, 0.62, vnoise(cloud2x * 4 + 10, v * 5 + 10))
+            * smoothstep(0.35, -0.15, v) * 0.2;
+
+          const horizon = smoothstep(0.04, 0.0, Math.abs(v - 0.3))
+            * (0.15 + Math.sin(u * 20 + t * 2) * 0.05);
+
+          const scatter = Math.max(0, 1 - rayDist / 0.6) * 0.08;
+
+          let val = sunCore + sunGlow + rays + sky + cloud1 + cloud2 + horizon + scatter;
+          row += charFor(Math.pow(sat(val), 0.7));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const u = x / w - 0.5, v = y / h - 0.5;
+      const sunDist = Math.sqrt(u * u * 4 + (v - 0.25) ** 2);
+
+      const blend = smoothstep(0.1, 0.4, sunDist);
+      const r = lerp(255, 100 + i * 80, blend) | 0;
+      const g = lerp(220, 150 + i * 60, blend) | 0;
+      const b = lerp(80, 190 + i * 65, blend) | 0;
+      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [200 + i * 55 | 0, 180 + i * 50 | 0, 80 + i * 60 | 0];
+    },
+    headerColor: [100, 170, 230],
+    titleColor: [255, 230, 120],
+  },
+
+  custom: {
+    render(t: number, w: number, h: number): string[] {
+      const p = mode!.params;
+      const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+
+          const swatchDist = sdBox(u, v, 0, 0, 0.3, 0.25);
+          const swatch = smoothstep(0.02, -0.01, swatchDist);
+          const swatchEdge = smoothstep(0.04, 0.01, swatchDist) * smoothstep(-0.01, 0.01, swatchDist);
+
+          const breathe = Math.sin(t * 1.5) * 0.06 + 0.94;
+          const inner = swatch * breathe;
+
+          const rippleD = Math.max(0, swatchDist);
+          const ripple1 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15) % 0.4))) * 0.2;
+          const ripple2 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15 + 0.2) % 0.4))) * 0.15;
+
+          const glow = smoothstep(0.4, -0.05, swatchDist) * 0.15;
+
+          const shimmer = swatch * (Math.sin((u + v) * 30 + t * 3) * 0.04 + 0.04);
+
+          let val = inner * 0.7 + swatchEdge * 0.3 + ripple1 + ripple2 + glow + shimmer;
+          row += charFor(Math.pow(sat(val), 0.8));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const p = mode!.params;
+      const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
+      const u = x / w - 0.5, v = y / h - 0.5;
+      const dist = Math.sqrt(u * u * 4 + v * v * 4);
+      const blend = smoothstep(0.3, 0.8, dist);
+      return [
+        lerp(cr * 0.5 + i * cr * 0.5, 80 + i * 60, blend) | 0,
+        lerp(cg * 0.5 + i * cg * 0.5, 70 + i * 50, blend) | 0,
+        lerp(cb * 0.5 + i * cb * 0.5, 60 + i * 40, blend) | 0,
+      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const p = mode!.params;
+      const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
+      return [
+        (cr * 0.4 + i * cr * 0.6) | 0,
+        (cg * 0.4 + i * cg * 0.6) | 0,
+        (cb * 0.4 + i * cb * 0.6) | 0,
+      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+    },
+    get headerColor(): RGB {
+      const p = mode!.params;
+      return [p.r ?? 200, p.g ?? 160, p.b ?? 100].map(v => Math.floor(v * 0.6)) as RGB;
+    },
+    get titleColor(): RGB {
+      const p = mode!.params;
+      return [p.r ?? 255, p.g ?? 200, p.b ?? 120] as RGB;
+    },
+  },
+};
+
+// -- shared success frame --
+
+function successFrame(t: number, w: number, h: number): string[] {
+  const lines: string[] = [];
+  for (let y = 0; y < h; y++) {
+    let row = "";
+    for (let x = 0; x < w; x++) {
+      const u = x / w - 0.5, v = y / h - 0.5;
+      const breathe = Math.sin(t * 1.8) * 0.08;
+      const orbDist = sdCircle(u, v, 0, 0, 0.18 + breathe);
+      const core = smoothstep(0.02, -0.04, orbDist);
+      const glow = smoothstep(0.2, -0.02, orbDist) * 0.6;
+      const ring1 = smoothstep(0.015, 0.0, Math.abs(orbDist + 0.05 + Math.sin(t * 3) * 0.01)) * 0.3;
+      const ring2 = smoothstep(0.015, 0.0, Math.abs(orbDist + 0.12 + Math.sin(t * 2.5 + 1) * 0.015)) * 0.2;
+      const angle = Math.atan2(v, u * A);
+      const rays = (Math.sin(angle * 6 + t * 1.2) * 0.5 + 0.5) * smoothstep(0.35, 0.05, -orbDist) * 0.25;
+      const shimmer = (noise(u + t * 0.05, v - t * 0.03) - 0.5) * 0.06 * glow;
+      let val = core + glow + ring1 + ring2 + rays + shimmer;
+      row += charFor(Math.pow(sat(val), 0.8));
+    }
+    lines.push(row);
+  }
+  return lines;
+}
+
+// -- renderer --
+
+const shader = shaders[arg!] || shaders.chill;
+
+class Renderer {
+  started = false;
+  interval: ReturnType<typeof setInterval> | null = null;
+  t = 0;
+  statusLines: string[] = [];
+
+  start() {
+    process.stdout.write(hide);
+    const title = `  ${mode!.title}  `;
+    const pad = Math.max(0, Math.floor((W - title.length) / 2));
+    const [hr, hg, hb] = shader.headerColor;
+    const [tr, tg, tb] = shader.titleColor;
+    process.stdout.write("\n");
+    process.stdout.write(`  ${rgb(hr, hg, hb, "~".repeat(W))}\n`);
+    process.stdout.write(`  ${" ".repeat(pad)}${bold(rgb(tr, tg, tb, title))}\n`);
+    process.stdout.write(`  ${rgb(hr, hg, hb, "~".repeat(W))}\n`);
+    process.stdout.write("\n");
+    this.statusLines = [];
+    this._drawShader();
+    this._drawStatus();
+    this.started = true;
+    this.interval = setInterval(() => { this.t += 0.08; this._redraw(); }, 50);
+  }
+
+  _drawShader() {
+    const lines = shader.render(this.t, W, H);
+    for (let y = 0; y < lines.length; y++) {
+      let out = "";
+      for (let x = 0; x < lines[y].length; x++) {
+        const ch = lines[y][x];
+        if (ch === " " || ch === "`") { out += ch; continue; }
+        const [r, g, b] = shader.color(x, y, ch, W, H);
+        out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
+      }
+      process.stdout.write(`  ${out}\n`);
+    }
+  }
+
+  _drawStatus() {
+    process.stdout.write("\n");
+    for (const line of this.statusLines) process.stdout.write(`${clr}  ${line}\n`);
+    for (let i = this.statusLines.length; i < 4; i++) process.stdout.write(`${clr}\n`);
+  }
+
+  _redraw() {
+    process.stdout.write(up(H + 6));
+    this._drawShader();
+    this._drawStatus();
+  }
+
+  setStatus(lines: string[]) { this.statusLines = lines; if (this.started) this._redraw(); }
+
+  async finish(success: boolean) {
+    if (this.interval) clearInterval(this.interval);
+    if (success) {
+      for (let i = 0; i < 30; i++) {
+        this.t += 0.1;
+        process.stdout.write(up(H + 6));
+        const lines = successFrame(this.t, W, H);
+        for (let y = 0; y < lines.length; y++) {
+          let out = "";
+          for (let x = 0; x < lines[y].length; x++) {
+            const ch = lines[y][x];
+            if (ch === " " || ch === "`") { out += ch; continue; }
+            const [r, g, b] = shader.successColor(ch);
+            out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
+          }
+          process.stdout.write(`  ${out}\n`);
+        }
+        this._drawStatus();
+        await sleep(45);
+      }
+    }
+    process.stdout.write(show);
+  }
+
+  stop() { if (this.interval) clearInterval(this.interval); process.stdout.write(show); }
+}
+
+// -- network --
+
+function getBroadcastAddress(): string | null {
+  for (const addrs of Object.values(networkInterfaces())) {
+    if (!addrs) continue;
+    for (const a of addrs) {
+      if (a.family === "IPv4" && !a.internal && a.netmask) {
+        const ip = a.address.split(".").map(Number);
+        const mask = a.netmask.split(".").map(Number);
+        return ip.map((o, i) => o | (~mask[i] & 255)).join(".");
+      }
+    }
+  }
+  return null;
+}
+
+function send(ip: string, payload: object, timeout = COMMAND_TIMEOUT_MS): Promise<WizResponse> {
+  return new Promise((resolve, reject) => {
+    const sock = createSocket("udp4");
+    const msg = Buffer.from(JSON.stringify(payload));
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); reject(new Error("timeout")); } }, timeout);
+    sock.on("error", (e) => { if (!done) { done = true; clearTimeout(timer); sock.close(); reject(e); } });
+    sock.on("message", (data) => {
+      if (!done) {
+        done = true; clearTimeout(timer); sock.close();
+        try { resolve(JSON.parse(data.toString())); }
+        catch { reject(new Error(`malformed response: ${data.toString().slice(0, 80)}`)); }
+      }
+    });
+    sock.send(msg, WIZ_PORT, ip, (e) => { if (e && !done) { done = true; clearTimeout(timer); sock.close(); reject(e); } });
+  });
+}
+
+function discoverByBroadcast(mac: string, broadcastAddr: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sock = createSocket("udp4");
+    let done = false;
+    const msg = Buffer.from(JSON.stringify({
+      method: "registration", params: { phoneMac: "AAAAAAAAAAAA", register: false, phoneIp: "0.0.0.0", id: "1" },
+    }));
+    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); reject(new Error("broadcast timeout")); } }, DISCOVERY_TIMEOUT_MS);
+    sock.on("error", (e) => { if (!done) { done = true; clearTimeout(timer); sock.close(); reject(e); } });
+    sock.on("message", (data: Buffer, rinfo: RemoteInfo) => {
+      if (done) return;
+      try {
+        const resp = JSON.parse(data.toString());
+        if (resp.result?.mac === mac) { done = true; clearTimeout(timer); sock.close(); resolve(rinfo.address); }
+      } catch {}
+    });
+    sock.bind(() => {
+      sock.setBroadcast(true);
+      sock.send(msg, WIZ_PORT, broadcastAddr);
+      setTimeout(() => { if (!done) sock.send(msg, WIZ_PORT, broadcastAddr); }, 1000);
+    });
+  });
+}
+
+function probeIP(ip: string, mac: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sock = createSocket("udp4");
+    let done = false;
+    const msg = Buffer.from(JSON.stringify({ method: "getSystemConfig", params: {} }));
+    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); reject(new Error("timeout")); } }, 500);
+    sock.on("error", () => { if (!done) { done = true; clearTimeout(timer); sock.close(); reject(new Error("error")); } });
+    sock.on("message", (data) => {
+      if (done) return;
+      done = true; clearTimeout(timer); sock.close();
+      try { const r = JSON.parse(data.toString()); r.result?.mac === mac ? resolve(ip) : reject(new Error("wrong mac")); }
+      catch { reject(new Error("parse")); }
+    });
+    sock.send(msg, WIZ_PORT, ip);
+  });
+}
+
+type ProgressCallback = (a1: string | number, a2?: number) => void;
+
+async function discoverBySubnetScan(mac: string, onProgress?: ProgressCallback): Promise<string> {
+  const base = (() => {
+    for (const addrs of Object.values(networkInterfaces())) {
+      if (!addrs) continue;
+      for (const a of addrs) { if (a.family === "IPv4" && !a.internal) return a.address.split(".").slice(0, 3).join("."); }
+    }
+    return null;
+  })();
+  if (!base) throw new Error("no network");
+  const batch = 30;
+  for (let s = 1; s < 255; s += batch) {
+    if (onProgress) onProgress(s, 254);
+    const probes: Promise<string | null>[] = [];
+    for (let i = s; i < Math.min(s + batch, 255); i++) probes.push(probeIP(`${base}.${i}`, mac).catch(() => null));
+    const found = (await Promise.all(probes)).find(Boolean);
+    if (found) return found;
+  }
+  throw new Error("not found");
+}
+
+async function discoverByMac(mac: string, broadcastAddr: string, onProgress?: ProgressCallback): Promise<string> {
+  try { return await discoverByBroadcast(mac, broadcastAddr); }
+  catch { if (onProgress) onProgress("broadcast failed, scanning subnet..."); return await discoverBySubnetScan(mac, onProgress); }
+}
+
+async function sendWithRetry(ip: string, payload: object, retries = MAX_RETRIES): Promise<WizResponse> {
+  let lastErr: Error | undefined;
+  for (let i = 0; i < retries; i++) {
+    try { return await send(ip, payload); }
+    catch (e) { lastErr = e as Error; if (i < retries - 1) await sleep(RETRY_DELAY_MS); }
+  }
+  throw lastErr;
+}
+
+function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+
+// -- main --
+
+async function main() {
+  const r = new Renderer();
+  process.on("SIGINT", () => { r.stop(); process.exit(130); });
+  process.on("SIGTERM", () => { r.stop(); process.exit(143); });
+
+  r.start();
+  r.setStatus([dim("scanning network...")]);
+
+  const broadcastAddr = getBroadcastAddress();
+  if (!broadcastAddr) {
+    r.setStatus([red("no network interface found"), "", dim("check that wi-fi is connected")]);
+    await sleep(1500); r.stop(); process.exit(1);
+  }
+
+  const macFmt = WIZ_MAC!.match(/.{2}/g)!.join(":");
+  r.setStatus([dim("scanning network..."), dim(`broadcast ${broadcastAddr}  target ${macFmt}`)]);
+
+  let ip: string;
+  try {
+    ip = await discoverByMac(WIZ_MAC!, broadcastAddr, (a1, a2) => {
+      if (typeof a1 === "string") r.setStatus([dim(a1), dim(`target ${macFmt}`)]);
+      else r.setStatus([dim(`scanning subnet... ${(a1 / a2! * 100) | 0}%`), dim(`target ${macFmt}`)]);
+    });
+  } catch {
+    r.setStatus([red("bulb not found on network"), "", dim("is it powered on? same wi-fi?"), dim(`mac ${macFmt}`)]);
+    await sleep(2000); r.stop(); process.exit(1);
+  }
+
+  r.setStatus([green(`found bulb at ${ip}`), dim(`mac ${macFmt}`), dim(`setting ${arg} mode...`)]);
+
+  let state: WizResponse | undefined;
+  try { state = await sendWithRetry(ip, { method: "getPilot", params: {} }); }
+  catch { r.setStatus([green(`found bulb at ${ip}`), yellow("could not read current state"), dim(`setting ${arg} mode...`)]); }
+
+  let resp: WizResponse;
+  try { resp = await sendWithRetry(ip, { method: "setPilot", params: mode!.params }); }
+  catch (e) {
+    r.setStatus([green(`found bulb at ${ip}`), red(`failed: ${(e as Error).message}`), "", dim("try power-cycling the bulb")]);
+    await sleep(2000); r.stop(); process.exit(1);
+  }
+
+  if (!resp.result?.success) {
+    r.setStatus([green(`found bulb at ${ip}`), red("bulb rejected command"), dim(JSON.stringify(resp).slice(0, 60))]);
+    await sleep(2000); r.stop(); process.exit(1);
+  }
+
+  let verified: boolean;
+  try { const c = await sendWithRetry(ip, { method: "getPilot", params: {} }); verified = mode!.verify(c.result as WizPilotState); }
+  catch { verified = false; }
+
+  const prev = state?.result;
+  const prevDesc = prev
+    ? dim(`was: ${prev.state ? "on" : "off"}, ${prev.dimming ?? "?"}%, ${prev.temp ?? [prev.r, prev.g, prev.b].join("/")}`)
+    : "";
+
+  r.setStatus([
+    verified ? green(`${arg} mode active`) : yellow(`${arg} mode sent (unverified)`),
+    dim(mode!.desc), prevDesc, verified ? dim(mode!.tagline) : "",
+  ].filter(Boolean));
+
+  await r.finish(true);
+  process.exit(0);
+}
+
+main();

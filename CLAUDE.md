@@ -10,15 +10,19 @@ No dependencies. No build step. The `wiz` file is both the source and the execut
 
 Everything lives in one file, organized top-to-bottom:
 
-1. `.env` loader (script-relative via `import.meta.url`)
+1. `.env` loader — non-fatal, sets `envLoaded` flag (script-relative via `import.meta.url`)
 2. Config constants and mode definitions (`MODES` object)
 3. Arg parser — supports preset flags, hex colors, brightness, overrides
 4. Terminal helpers — ANSI escape codes, cursor control
 5. SDF toolkit — `smoothstep`, `sdCircle`, `sdBox`, value noise, density ramp
-6. Shaders — one per mode (movie, chill, day, custom), each with `render(t, w, h)` and `color(x, y, ch, w, h)`
-7. Renderer class — drives the animation loop at 50ms interval, handles status lines
-8. Network — UDP send/receive, broadcast discovery, subnet scan fallback, retry logic
-9. `main()` — orchestrates discovery → getPilot → setPilot → verify → success animation
+6. Shader factory — `createShaders(mode)` returns per-mode shaders, avoids null mode refs at module scope
+7. Renderer class — takes shader + title, drives the animation loop at 50ms interval
+8. Helpers — `saveEnv`, `formatMac`, `describeState`, `promptInput`
+9. Network — UDP send/receive, broadcast discovery, subnet scan fallback, retry logic
+10. Discover-all primitives — `discoverAll` (broadcast), `discoverAllSubnetScan`, `getSystemConfig`
+11. Guards — `requireMac()`, `requireBulbIp(mac)` with cached IP fast path
+12. Commands — `cmdDiscover`, `cmdOn`, `cmdOff`, `cmdStatus`, `cmdAnimatedPreset`
+13. Command router — entry point, dispatches based on `process.argv[2]`
 
 ## Wiz protocol
 
@@ -43,10 +47,18 @@ Everything lives in one file, organized top-to-bottom:
 | File | Purpose |
 |------|---------|
 | `wiz` | The entire app — executable Bun script |
-| `.env` | `WIZ_MAC=<mac>` — not committed |
+| `.env` | `WIZ_MAC=<mac>` + `WIZ_IP=<ip>` — not committed, written by `wiz discover` |
 | `env.example` | Template for `.env` |
 | `.gitignore` | Ignores `.env` and `node_modules/` |
 
 ## Testing
 
-No test suite. Test by running `wiz -movie`, `wiz -chill`, `wiz -day`, or `wiz <hex>` against a real bulb on the network.
+No test suite. Test against a real bulb on the network:
+
+- `wiz discover` — table shows devices, selection saves to `.env`
+- `wiz status` — output matches physical bulb state
+- `wiz off` → `wiz on` — bulb toggles, output shows state
+- `wiz on` (second run) — cached IP fast path, no scan
+- `wiz -chill` — animated preset flow still works
+- `wiz` with no `.env` — first-run welcome, no crash
+- Delete `.env`, `wiz -chill` — helpful error pointing to `wiz discover`

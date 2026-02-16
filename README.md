@@ -7,23 +7,29 @@ Each mode plays a unique ASCII shader animation in your terminal while setting t
 ## Setup
 
 ```sh
-# clone and configure
-cp env.example .env
-# edit .env — set WIZ_MAC to your bulb's MAC address (no colons, lowercase)
-
 # symlink into your PATH
-ln -s "$(pwd)/wiz" ~/bin/wiz
+ln -s "$(pwd)/wiz.ts" ~/bin/wiz
+
+# discover your bulb and save config
+wiz discover
 ```
 
 Requires [Bun](https://bun.sh) (`brew install oven-sh/bun/bun`).
 
 ## Usage
 
-```
-wiz <mode> [options]
+### Commands
+
+```sh
+wiz discover        # scan network, pick your bulb, save to .env
+wiz on              # turn light on
+wiz off             # turn light off
+wiz status          # show current bulb state
 ```
 
 ### Presets
+
+Each preset plays a unique ASCII shader animation while setting the light.
 
 | Mode | Brightness | Temp | Use case |
 |------|-----------|------|----------|

@@ -88,8 +88,10 @@ interface DiscoveredBulb {
 // -- config --
 
 const WIZ_PORT = 38899;
-const DISCOVERY_TIMEOUT_MS = 4000;
+const DISCOVERY_TIMEOUT_MS = 3000;
 const COMMAND_TIMEOUT_MS = 2000;
+const SUBNET_SCAN_TIMEOUT_MS = 200;
+const SUBNET_BATCH_SIZE = 50;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
 
@@ -822,7 +824,7 @@ function probeIP(ip: string, mac: string): Promise<string> {
     const sock = createSocket("udp4");
     let done = false;
     const msg = Buffer.from(JSON.stringify({ method: "getSystemConfig", params: {} }));
-    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); reject(new Error("timeout")); } }, 500);
+    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); reject(new Error("timeout")); } }, SUBNET_SCAN_TIMEOUT_MS);
     sock.on("error", () => { if (!done) { done = true; clearTimeout(timer); sock.close(); reject(new Error("error")); } });
     sock.on("message", (data) => {
       if (done) return;
@@ -845,7 +847,7 @@ async function discoverBySubnetScan(mac: string, onProgress?: ProgressCallback):
     return null;
   })();
   if (!base) throw new Error("no network");
-  const batch = 30;
+  const batch = SUBNET_BATCH_SIZE;
   for (let s = 1; s < 255; s += batch) {
     if (onProgress) onProgress(s, 254);
     const probes: Promise<string | null>[] = [];
@@ -856,9 +858,30 @@ async function discoverBySubnetScan(mac: string, onProgress?: ProgressCallback):
   throw new Error("not found");
 }
 
-async function discoverByMac(mac: string, broadcastAddr: string, onProgress?: ProgressCallback): Promise<string> {
-  try { return await discoverByBroadcast(mac, broadcastAddr); }
-  catch { if (onProgress) onProgress("broadcast failed, scanning subnet..."); return await discoverBySubnetScan(mac, onProgress); }
+async function discoverByMac(mac: string, broadcastAddr: string, onProgress?: ProgressCallback): Promise<{ ip: string; usedSubnetScan: boolean }> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let failures = 0;
+
+    const finish = (ip: string, usedSubnetScan: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ip, usedSubnetScan });
+    };
+
+    const fail = () => {
+      failures++;
+      if (failures >= 2) reject(new Error("not found"));
+    };
+
+    discoverByBroadcast(mac, broadcastAddr).then(ip => finish(ip, false)).catch(fail);
+
+    setTimeout(() => {
+      if (settled) return;
+      if (onProgress) onProgress("scanning subnet...");
+      discoverBySubnetScan(mac, onProgress).then(ip => finish(ip, true)).catch(fail);
+    }, 500);
+  });
 }
 
 async function sendWithRetry(ip: string, payload: object, retries = MAX_RETRIES): Promise<WizResponse> {
@@ -877,7 +900,7 @@ function probeAny(ip: string): Promise<{ ip: string; mac: string } | null> {
     const sock = createSocket("udp4");
     let done = false;
     const msg = Buffer.from(JSON.stringify({ method: "getSystemConfig", params: {} }));
-    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); resolve(null); } }, 500);
+    const timer = setTimeout(() => { if (!done) { done = true; sock.close(); resolve(null); } }, SUBNET_SCAN_TIMEOUT_MS);
     sock.on("error", () => { if (!done) { done = true; clearTimeout(timer); sock.close(); resolve(null); } });
     sock.on("message", (data) => {
       if (done) return;
@@ -932,7 +955,7 @@ async function discoverAllSubnetScan(onProgress?: ProgressCallback): Promise<Map
   if (!base) return new Map();
 
   const found = new Map<string, string>();
-  const batch = 30;
+  const batch = SUBNET_BATCH_SIZE;
   for (let s = 1; s < 255; s += batch) {
     if (onProgress) onProgress(s, 254);
     const probes: Promise<void>[] = [];
@@ -977,7 +1000,14 @@ function requireMac(): string {
   return mac;
 }
 
-async function requireBulbIp(mac: string): Promise<string> {
+interface RequireBulbIpOpts {
+  onStatus?: (lines: string[]) => void;
+}
+
+async function requireBulbIp(mac: string, opts?: RequireBulbIpOpts): Promise<string> {
+  const onStatus = opts?.onStatus;
+  const macFmt = formatMac(mac);
+
   const cachedIp = process.env.WIZ_IP;
   if (cachedIp) {
     try {
@@ -988,22 +1018,49 @@ async function requireBulbIp(mac: string): Promise<string> {
 
   const broadcastAddr = getBroadcastAddress();
   if (!broadcastAddr) {
+    if (onStatus) throw new Error("no network interface found");
     console.error(red("  no network interface found"));
     process.exit(1);
   }
 
+  const skipBroadcast = process.env.WIZ_SKIP_BROADCAST === "1";
   let ip: string;
+  let usedSubnetScan = false;
+
   try {
-    ip = await discoverByMac(mac, broadcastAddr);
+    if (skipBroadcast) {
+      if (onStatus) onStatus([dim("scanning subnet..."), dim(`target ${macFmt}`)]);
+      ip = await discoverBySubnetScan(mac, (a1, a2) => {
+        if (typeof a1 === "number" && a2 && onStatus) {
+          onStatus([dim(`scanning subnet... ${(a1 / a2 * 100) | 0}%`), dim(`target ${macFmt}`)]);
+        }
+      });
+      usedSubnetScan = true;
+    } else {
+      if (onStatus) onStatus([dim("scanning network..."), dim(`broadcast ${broadcastAddr}  target ${macFmt}`)]);
+      const result = await discoverByMac(mac, broadcastAddr, (a1, a2) => {
+        if (onStatus) {
+          if (typeof a1 === "string") onStatus([dim(a1), dim(`target ${macFmt}`)]);
+          else if (typeof a1 === "number" && a2) onStatus([dim(`scanning subnet... ${(a1 / a2 * 100) | 0}%`), dim(`target ${macFmt}`)]);
+        }
+      });
+      ip = result.ip;
+      usedSubnetScan = result.usedSubnetScan;
+    }
   } catch {
+    if (onStatus) throw new Error("bulb not found on network");
     console.error(red("  bulb not found on network"));
-    console.error(dim(`  mac ${formatMac(mac)}`));
+    console.error(dim(`  mac ${macFmt}`));
     process.exit(1);
   }
 
-  if (ip !== cachedIp) {
-    saveEnv({ WIZ_IP: ip });
-    process.env.WIZ_IP = ip;
+  const updates: Record<string, string> = {};
+  if (ip !== cachedIp) updates.WIZ_IP = ip;
+  if (usedSubnetScan && !skipBroadcast) updates.WIZ_SKIP_BROADCAST = "1";
+  if (Object.keys(updates).length > 0) {
+    saveEnv(updates);
+    if (updates.WIZ_IP) process.env.WIZ_IP = ip;
+    if (updates.WIZ_SKIP_BROADCAST) process.env.WIZ_SKIP_BROADCAST = "1";
   }
 
   return ip;
@@ -1086,9 +1143,10 @@ async function cmdDiscover() {
   }
 
   const chosen = bulbs[selection];
-  saveEnv({ WIZ_MAC: chosen.mac, WIZ_IP: chosen.ip });
+  saveEnv({ WIZ_MAC: chosen.mac, WIZ_IP: chosen.ip, WIZ_SKIP_BROADCAST: "" });
   process.env.WIZ_MAC = chosen.mac;
   process.env.WIZ_IP = chosen.ip;
+  delete process.env.WIZ_SKIP_BROADCAST;
 
   if (currentMac && currentMac !== chosen.mac && currentMac !== "your_bulb_mac_here") {
     console.log(dim(`  updated: ${formatMac(currentMac)} → ${formatMac(chosen.mac)}`));
@@ -1167,31 +1225,19 @@ async function cmdAnimatedPreset() {
   process.on("SIGTERM", () => { r.stop(); process.exit(143); });
 
   r.start();
-  r.setStatus([dim("scanning network...")]);
-
-  const broadcastAddr = getBroadcastAddress();
-  if (!broadcastAddr) {
-    r.setStatus([red("no network interface found"), "", dim("check that wi-fi is connected")]);
-    await sleep(1500); r.stop(); process.exit(1);
-  }
 
   const macFmt = formatMac(mac);
-  r.setStatus([dim("scanning network..."), dim(`broadcast ${broadcastAddr}  target ${macFmt}`)]);
-
   let ip: string;
   try {
-    ip = await discoverByMac(mac, broadcastAddr, (a1, a2) => {
-      if (typeof a1 === "string") r.setStatus([dim(a1), dim(`target ${macFmt}`)]);
-      else r.setStatus([dim(`scanning subnet... ${(a1 / a2! * 100) | 0}%`), dim(`target ${macFmt}`)]);
-    });
-  } catch {
-    r.setStatus([red("bulb not found on network"), "", dim("is it powered on? same wi-fi?"), dim(`mac ${macFmt}`)]);
+    ip = await requireBulbIp(mac, { onStatus: (lines) => r.setStatus(lines) });
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg === "no network interface found") {
+      r.setStatus([red("no network interface found"), "", dim("check that wi-fi is connected")]);
+    } else {
+      r.setStatus([red("bulb not found on network"), "", dim("is it powered on? same wi-fi?"), dim(`mac ${macFmt}`)]);
+    }
     await sleep(2000); r.stop(); process.exit(1);
-  }
-
-  if (ip !== process.env.WIZ_IP) {
-    saveEnv({ WIZ_IP: ip });
-    process.env.WIZ_IP = ip;
   }
 
   r.setStatus([green(`found bulb at ${ip}`), dim(`mac ${macFmt}`), dim(`setting ${arg} mode...`)]);

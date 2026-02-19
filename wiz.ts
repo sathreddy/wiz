@@ -54,20 +54,23 @@ interface WizResponse {
 
 type RGB = [number, number, number];
 
-interface Mode {
+interface Preset {
   title: string;
   params: WizPilotParams;
   desc: string;
   verify: (s: WizPilotState) => boolean;
   tagline: string;
-}
-
-interface Shader {
+  helpText: string;
   render(t: number, w: number, h: number): string[];
   color(x: number, y: number, ch: string, w: number, h: number): RGB;
   successColor(ch: string): RGB;
   headerColor: RGB;
   titleColor: RGB;
+}
+
+interface ResolvedPreset {
+  name: string;
+  preset: Preset;
 }
 
 interface Particle {
@@ -85,6 +88,30 @@ interface DiscoveredBulb {
   state: WizPilotState | null;
 }
 
+interface Command {
+  aliases: string[];
+  usage: string;
+  desc: string;
+  run: () => Promise<void> | void;
+  showInHelp?: boolean;
+}
+
+interface ExecutePresetResult {
+  ip: string;
+  macFmt: string;
+  prevState: WizResponse | undefined;
+  verified: boolean;
+}
+
+type PresetExecutionErrorCode = "no_network" | "bulb_not_found" | "set_failed" | "rejected";
+
+interface PresetExecutionError extends Error {
+  code: PresetExecutionErrorCode;
+  macFmt: string;
+  ip?: string;
+  detail?: string;
+}
+
 // -- config --
 
 const WIZ_PORT = 38899;
@@ -94,110 +121,6 @@ const SUBNET_SCAN_TIMEOUT_MS = 200;
 const SUBNET_BATCH_SIZE = 50;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 500;
-
-const MODES: Record<string, Mode> = {
-  movie: {
-    title: "m o v i e t i m e",
-    params: { state: true, dimming: 1, temp: 2200 },
-    desc: "1% brightness  ·  2200K warm white",
-    verify: (s) => s.state === true && s.dimming <= 2 && s.temp === 2200,
-    tagline: "enjoy the movie",
-  },
-  chill: {
-    title: "c h i l l t i m e",
-    params: { state: true, dimming: 40, temp: 2700 },
-    desc: "40% brightness  ·  2700K warm white",
-    verify: (s) => s.state === true && s.dimming >= 38 && s.dimming <= 42 && s.temp === 2700,
-    tagline: "time to unwind",
-  },
-  day: {
-    title: "d a y t i m e",
-    params: { state: true, dimming: 100, temp: 5000 },
-    desc: "100% brightness  ·  5000K daylight",
-    verify: (s) => s.state === true && s.dimming >= 98 && s.temp === 5000,
-    tagline: "let there be light",
-  },
-};
-
-// -- parse args --
-
-interface ParsedArgs {
-  modeName: string | null;
-  hexColor: string | null;
-  brightness: number | null;
-}
-
-function parseArgs(): ParsedArgs {
-  const args = process.argv.slice(2);
-  let modeName: string | null = null;
-  let hexColor: string | null = null;
-  let brightness: number | null = null;
-
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i].replace(/^-+/, "");
-
-    if (a in MODES) {
-      modeName = a;
-    } else if (a === "color" || a === "c") {
-      hexColor = args[++i];
-    } else if (a === "brightness" || a === "bright" || a === "b" || a === "dim") {
-      brightness = parseInt(args[++i], 10);
-    } else if (/^[0-9a-fA-F]{3,6}$/.test(a) || /^#[0-9a-fA-F]{3,6}$/.test(args[i])) {
-      hexColor = a.replace(/^#/, "");
-    } else if (/^\d+%?$/.test(a)) {
-      brightness = parseInt(a, 10);
-    }
-  }
-
-  if (hexColor) {
-    hexColor = hexColor.replace(/^#/, "");
-    if (hexColor.length === 3) hexColor = hexColor.split("").map(c => c + c).join("");
-    if (!/^[0-9a-fA-F]{6}$/.test(hexColor)) {
-      console.error(`\x1b[31m  invalid hex color: ${hexColor}\x1b[0m`);
-      process.exit(1);
-    }
-  }
-
-  if (brightness !== null && (isNaN(brightness) || brightness < 1 || brightness > 100)) {
-    console.error(`\x1b[31m  brightness must be 1-100\x1b[0m`);
-    process.exit(1);
-  }
-
-  if (!modeName && (hexColor || brightness !== null)) {
-    const r = hexColor ? parseInt(hexColor.slice(0, 2), 16) : null;
-    const g = hexColor ? parseInt(hexColor.slice(2, 4), 16) : null;
-    const b = hexColor ? parseInt(hexColor.slice(4, 6), 16) : null;
-    const dim = brightness ?? 100;
-
-    const params: WizPilotParams = { state: true, dimming: dim };
-    if (hexColor) {
-      params.r = r!; params.g = g!; params.b = b!; params.w = 0; params.c = 0;
-    }
-
-    const desc = hexColor
-      ? `${dim}% brightness  ·  rgb(${r}, ${g}, ${b})`
-      : `${dim}% brightness`;
-
-    MODES.custom = {
-      title: hexColor ? `# ${hexColor.toUpperCase()}` : `${dim} %`,
-      params,
-      desc,
-      verify: (s) => s.state === true,
-      tagline: "looking good",
-    };
-    return { modeName: "custom", hexColor, brightness };
-  }
-
-  if (modeName && brightness !== null) {
-    MODES[modeName] = {
-      ...MODES[modeName],
-      params: { ...MODES[modeName].params, dimming: brightness },
-      desc: MODES[modeName].desc.replace(/\d+% brightness/, `${brightness}% brightness`),
-    };
-  }
-
-  return { modeName, hexColor, brightness };
-}
 
 // -- terminal --
 
@@ -273,318 +196,426 @@ const particles: Particle[] = Array.from({ length: 18 }, (_, i) => ({
 //  SHADER FACTORY
 // ============================================================
 
-function createShaders(currentMode: Mode): Record<string, Shader> {
+function presetMovie(): Preset {
   return {
-    movie: {
-      render(t: number, w: number, h: number): string[] {
-        const lines: string[] = [];
+    title: "m o v i e t i m e",
+    params: { state: true, dimming: 1, temp: 2200 },
+    desc: "1% brightness  ·  2200K warm white",
+    verify: (s) => s.state === true && s.dimming <= 2 && s.temp === 2200,
+    tagline: "enjoy the movie",
+    helpText: "1% · 2200K  — pico projector darkness",
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
 
-        const pEmber    = smoothstep(0.0, 1.2, t);
-        const pIgnite   = smoothstep(1.0, 2.0, t);
-        const pBeamGrow = smoothstep(1.8, 4.0, t);
-        const pScreen   = smoothstep(3.5, 5.0, t);
-        const pDust     = smoothstep(3.0, 5.5, t);
-        const pFilm     = smoothstep(4.5, 6.5, t);
-        const pSettle   = smoothstep(6.0, 8.0, t);
-        const pBulb     = smoothstep(5.0, 7.0, t);
+      const pEmber    = smoothstep(0.0, 1.2, t);
+      const pIgnite   = smoothstep(1.0, 2.0, t);
+      const pBeamGrow = smoothstep(1.8, 4.0, t);
+      const pScreen   = smoothstep(3.5, 5.0, t);
+      const pDust     = smoothstep(3.0, 5.5, t);
+      const pFilm     = smoothstep(4.5, 6.5, t);
+      const pSettle   = smoothstep(6.0, 8.0, t);
+      const pBulb     = smoothstep(5.0, 7.0, t);
 
-        const ox = -0.42, oy = 0.42;
-        const bx = 0.42, by = -0.92;
-        const bLen = Math.sqrt(bx * bx + by * by);
-        const bnx = bx / bLen, bny = by / bLen;
+      const ox = -0.42, oy = 0.42;
+      const bx = 0.42, by = -0.92;
+      const bLen = Math.sqrt(bx * bx + by * by);
+      const bnx = bx / bLen, bny = by / bLen;
 
-        for (let y = 0; y < h; y++) {
-          let row = "";
-          for (let x = 0; x < w; x++) {
-            const u = x / w - 0.5, v = y / h - 0.5;
-            let val = 0;
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+          let val = 0;
 
-            const emberDist = sdCircle(u, v, ox, oy, 0.015);
-            const emberThrob = 0.7 + 0.3 * Math.sin(t * 8);
-            const ember = smoothstep(0.04, -0.02, emberDist) * pEmber * emberThrob;
-            const emberHalo = smoothstep(0.12, -0.01, emberDist) * pEmber * 0.2;
+          const emberDist = sdCircle(u, v, ox, oy, 0.015);
+          const emberThrob = 0.7 + 0.3 * Math.sin(t * 8);
+          const ember = smoothstep(0.04, -0.02, emberDist) * pEmber * emberThrob;
+          const emberHalo = smoothstep(0.12, -0.01, emberDist) * pEmber * 0.2;
 
-            const toU = u - ox, toV = v - oy;
-            const along = toU * bnx + toV * bny;
-            const perpU = toU - bnx * along, perpV = toV - bny * along;
-            const perp = Math.sqrt(perpU * perpU + perpV * perpV);
+          const toU = u - ox, toV = v - oy;
+          const along = toU * bnx + toV * bny;
+          const perpU = toU - bnx * along, perpV = toV - bny * along;
+          const perp = Math.sqrt(perpU * perpU + perpV * perpV);
 
-            const beamReach = pIgnite * 0.3 + pBeamGrow * 0.75;
-            const reachMask = smoothstep(beamReach + 0.02, beamReach - 0.05, along)
-              * smoothstep(-0.02, 0.04, along);
+          const beamReach = pIgnite * 0.3 + pBeamGrow * 0.75;
+          const reachMask = smoothstep(beamReach + 0.02, beamReach - 0.05, along)
+            * smoothstep(-0.02, 0.04, along);
 
-            const thinness = lerp(0.005, 0.04, pBeamGrow);
-            const spread = thinness + Math.max(0, along) * lerp(0.02, 0.35, pBeamGrow);
-            const beamEdge = smoothstep(spread, spread * 0.2, perp);
+          const thinness = lerp(0.005, 0.04, pBeamGrow);
+          const spread = thinness + Math.max(0, along) * lerp(0.02, 0.35, pBeamGrow);
+          const beamEdge = smoothstep(spread, spread * 0.2, perp);
 
-            const beamCore = smoothstep(spread * 0.3, 0, perp) * 0.3;
-            const beam = (beamEdge * 0.55 + beamCore) * reachMask * pIgnite;
+          const beamCore = smoothstep(spread * 0.3, 0, perp) * 0.3;
+          const beam = (beamEdge * 0.55 + beamCore) * reachMask * pIgnite;
 
-            const lampFlicker = lerp(
-              0.6 + 0.4 * Math.sin(t * 15) * Math.sin(t * 23),
-              0.95 + 0.05 * Math.sin(t * 7),
-              pSettle
-            );
+          const lampFlicker = lerp(
+            0.6 + 0.4 * Math.sin(t * 15) * Math.sin(t * 23),
+            0.95 + 0.05 * Math.sin(t * 7),
+            pSettle
+          );
 
-            let dust = 0;
-            if (pDust > 0.01) {
-              for (const p of particles) {
-                const pt = t * p.speed + p.phase;
-                const prog = (pt % 1.4) / 1.4;
-                const px = ox + bx * prog + Math.sin(pt * 1.7) * p.drift * 0.12;
-                const py = oy + by * prog + Math.cos(pt * 2.3) * 0.04;
-                const dd = sdCircle(u, v, px, py, p.size);
-                dust += smoothstep(0.025, -0.005, dd) * 0.3;
-              }
-              dust *= pDust * beam;
+          let dust = 0;
+          if (pDust > 0.01) {
+            for (const p of particles) {
+              const pt = t * p.speed + p.phase;
+              const prog = (pt % 1.4) / 1.4;
+              const px = ox + bx * prog + Math.sin(pt * 1.7) * p.drift * 0.12;
+              const py = oy + by * prog + Math.cos(pt * 2.3) * 0.04;
+              const dd = sdCircle(u, v, px, py, p.size);
+              dust += smoothstep(0.025, -0.005, dd) * 0.3;
             }
-
-            const screenW = 0.28, screenH = 0.065;
-            const screenCy = -0.38;
-            const sDist = sdBox(u, v, 0, screenCy, screenW, screenH);
-
-            const irisR = pScreen * 0.45;
-            const irisDist = sdCircle(u, v, 0, screenCy, irisR);
-            const irisMask = smoothstep(0.02, -0.01, irisDist);
-
-            const sEdge = smoothstep(0.008, -0.004, sDist);
-            const sGlow = smoothstep(0.1, -0.01, sDist) * 0.4;
-            const screen = sEdge * irisMask * pScreen;
-            const screenGlow = sGlow * pScreen * 0.5;
-
-            const sFlk = lerp(1.0,
-              0.7 + 0.3 * (Math.sin(t * 7.3) * 0.5 + 0.5) * (Math.sin(t * 11.1) * 0.3 + 0.7),
-              pFilm);
-            const filmBand = (Math.sin((u + t * 0.15) * 25) * 0.15
-              + Math.sin((v + t * 0.08) * 40) * 0.1) * pFilm;
-
-            const bp = 0.5 + 0.5 * Math.sin(t * 2.2);
-            const bDist = sdCircle(u, v, 0, 0.48, 0.018 + bp * 0.006);
-            const bulbGlow = smoothstep(0.12, -0.01, bDist) * (0.2 + bp * 0.1) * pBulb;
-            const bulbCore = smoothstep(0.008, -0.008, bDist) * 0.5 * pBulb;
-            const bulbLight = Math.max(0, 1 - sdCircle(u, v, 0, 0.48, 0) / 0.45)
-              * 0.1 * (0.8 + bp * 0.2) * pBulb;
-
-            const scan = (Math.sin(v * h * 6.28 + t * 4) * 0.5 + 0.5) * 0.05 * pFilm;
-            const grain = (noise(u + t * 0.1, v + t * 0.07) - 0.5) * 0.07 * pFilm;
-
-            val += ember + emberHalo;
-            val += beam * lampFlicker;
-            val += dust;
-            val += screen * 0.7 * (sFlk + filmBand);
-            val += screenGlow * sFlk;
-            val += bulbGlow + bulbCore + bulbLight;
-            val += scan * beam;
-            val += grain * Math.max(beam, screen * 0.5);
-
-            row += charFor(Math.pow(sat(val), 0.85));
+            dust *= pDust * beam;
           }
-          lines.push(row);
+
+          const screenW = 0.28, screenH = 0.065;
+          const screenCy = -0.38;
+          const sDist = sdBox(u, v, 0, screenCy, screenW, screenH);
+
+          const irisR = pScreen * 0.45;
+          const irisDist = sdCircle(u, v, 0, screenCy, irisR);
+          const irisMask = smoothstep(0.02, -0.01, irisDist);
+
+          const sEdge = smoothstep(0.008, -0.004, sDist);
+          const sGlow = smoothstep(0.1, -0.01, sDist) * 0.4;
+          const screen = sEdge * irisMask * pScreen;
+          const screenGlow = sGlow * pScreen * 0.5;
+
+          const sFlk = lerp(1.0,
+            0.7 + 0.3 * (Math.sin(t * 7.3) * 0.5 + 0.5) * (Math.sin(t * 11.1) * 0.3 + 0.7),
+            pFilm);
+          const filmBand = (Math.sin((u + t * 0.15) * 25) * 0.15
+            + Math.sin((v + t * 0.08) * 40) * 0.1) * pFilm;
+
+          const bp = 0.5 + 0.5 * Math.sin(t * 2.2);
+          const bDist = sdCircle(u, v, 0, 0.48, 0.018 + bp * 0.006);
+          const bulbGlow = smoothstep(0.12, -0.01, bDist) * (0.2 + bp * 0.1) * pBulb;
+          const bulbCore = smoothstep(0.008, -0.008, bDist) * 0.5 * pBulb;
+          const bulbLight = Math.max(0, 1 - sdCircle(u, v, 0, 0.48, 0) / 0.45)
+            * 0.1 * (0.8 + bp * 0.2) * pBulb;
+
+          const scan = (Math.sin(v * h * 6.28 + t * 4) * 0.5 + 0.5) * 0.05 * pFilm;
+          const grain = (noise(u + t * 0.1, v + t * 0.07) - 0.5) * 0.07 * pFilm;
+
+          val += ember + emberHalo;
+          val += beam * lampFlicker;
+          val += dust;
+          val += screen * 0.7 * (sFlk + filmBand);
+          val += screenGlow * sFlk;
+          val += bulbGlow + bulbCore + bulbLight;
+          val += scan * beam;
+          val += grain * Math.max(beam, screen * 0.5);
+
+          row += charFor(Math.pow(sat(val), 0.85));
         }
-        return lines;
-      },
-      color(x: number, y: number, ch: string, w: number, h: number): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        const u = x / w, v = y / h;
-        if (v < 0.15 && u > 0.2 && u < 0.8 && i > 0.1)
-          return [140 + i * 115 | 0, 150 + i * 105 | 0, 180 + i * 75 | 0];
-        if (v > 0.75 && u < 0.2)
-          return [200 + i * 55 | 0, 160 + i * 60 | 0, 80 + i * 40 | 0];
-        if (v > 0.8 && u > 0.35 && u < 0.65)
-          return [160 + i * 95 | 0, 100 + i * 70 | 0, 20 + i * 30 | 0];
-        if (i > 0.03)
-          return [110 + i * 145 | 0, 85 + i * 105 | 0, 40 + i * 55 | 0];
-        return [70 + i * 100 | 0, 60 + i * 80 | 0, 35 + i * 50 | 0];
-      },
-      successColor(ch: string): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        return [180 + i * 75 | 0, 110 + i * 80 | 0, 20 + i * 40 | 0];
-      },
-      headerColor: [208, 140, 40],
-      titleColor: [255, 200, 60],
+        lines.push(row);
+      }
+      return lines;
     },
-
-    chill: {
-      render(t: number, w: number, h: number): string[] {
-        const lines: string[] = [];
-        for (let y = 0; y < h; y++) {
-          let row = "";
-          for (let x = 0; x < w; x++) {
-            const u = x / w - 0.5, v = y / h - 0.5;
-
-            const b1x = Math.sin(t * 0.4) * 0.2, b1y = Math.cos(t * 0.35) * 0.25;
-            const b2x = Math.cos(t * 0.3 + 2) * 0.25, b2y = Math.sin(t * 0.45 + 1) * 0.2;
-            const b3x = Math.sin(t * 0.5 + 4) * 0.15, b3y = Math.cos(t * 0.25 + 3) * 0.3;
-
-            const d1 = sdCircle(u, v, b1x, b1y, 0.12 + Math.sin(t * 0.7) * 0.03);
-            const d2 = sdCircle(u, v, b2x, b2y, 0.1 + Math.cos(t * 0.6) * 0.02);
-            const d3 = sdCircle(u, v, b3x, b3y, 0.08 + Math.sin(t * 0.8 + 2) * 0.025);
-
-            const k = 0.15;
-            const h1 = sat(0.5 + 0.5 * (d2 - d1) / k);
-            const m12 = d1 * h1 + d2 * (1 - h1) - k * h1 * (1 - h1);
-            const h2 = sat(0.5 + 0.5 * (d3 - m12) / k);
-            const merged = m12 * h2 + d3 * (1 - h2) - k * h2 * (1 - h2);
-
-            const blobVal = smoothstep(0.06, -0.04, merged);
-            const blobEdge = smoothstep(0.02, -0.01, merged) * 0.3;
-
-            const warmth = smoothstep(0.5, -0.3, v) * 0.2;
-
-            const wave = (Math.sin(u * 8 + t * 0.8 + v * 4) * 0.5 + 0.5)
-              * (Math.cos(v * 6 - t * 0.5) * 0.5 + 0.5) * 0.15;
-
-            const flicker = vnoise(u * 3 + t * 0.5, v * 3 + t * 0.3) * 0.12;
-
-            const dist = Math.sqrt(u * u * 4 + v * v * 4);
-            const vignette = smoothstep(0.9, 0.3, dist);
-
-            let val = (blobVal * 0.6 + blobEdge + warmth + wave + flicker) * vignette;
-            row += charFor(Math.pow(sat(val), 0.75));
-          }
-          lines.push(row);
-        }
-        return lines;
-      },
-      color(x: number, y: number, ch: string, w: number, h: number): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        const v = y / h;
-        const r = lerp(160, 220, i) + v * -20 | 0;
-        const g = lerp(80, 140, i) + v * -30 | 0;
-        const b = lerp(50, 80, i) + v * -20 | 0;
-        return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
-      },
-      successColor(ch: string): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        return [180 + i * 60 | 0, 120 + i * 50 | 0, 50 + i * 30 | 0];
-      },
-      headerColor: [210, 130, 70],
-      titleColor: [255, 180, 100],
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const u = x / w, v = y / h;
+      if (v < 0.15 && u > 0.2 && u < 0.8 && i > 0.1)
+        return [140 + i * 115 | 0, 150 + i * 105 | 0, 180 + i * 75 | 0];
+      if (v > 0.75 && u < 0.2)
+        return [200 + i * 55 | 0, 160 + i * 60 | 0, 80 + i * 40 | 0];
+      if (v > 0.8 && u > 0.35 && u < 0.65)
+        return [160 + i * 95 | 0, 100 + i * 70 | 0, 20 + i * 30 | 0];
+      if (i > 0.03)
+        return [110 + i * 145 | 0, 85 + i * 105 | 0, 40 + i * 55 | 0];
+      return [70 + i * 100 | 0, 60 + i * 80 | 0, 35 + i * 50 | 0];
     },
-
-    day: {
-      render(t: number, w: number, h: number): string[] {
-        const lines: string[] = [];
-        for (let y = 0; y < h; y++) {
-          let row = "";
-          for (let x = 0; x < w; x++) {
-            const u = x / w - 0.5, v = y / h - 0.5;
-
-            const sunY = 0.25 - Math.sin(t * 0.3) * 0.05;
-            const sunDist = sdCircle(u, v, 0, sunY, 0.12);
-            const sunCore = smoothstep(0.01, -0.03, sunDist);
-            const sunGlow = smoothstep(0.25, -0.02, sunDist) * 0.5;
-
-            const angle = Math.atan2(v - sunY, u * A);
-            const rayCount = 12;
-            const rayAngle = ((angle / (2 * Math.PI)) * rayCount + t * 0.3) % 1;
-            const rayPattern = (Math.sin(rayAngle * Math.PI * 2) * 0.5 + 0.5);
-            const rayDist = Math.sqrt((u * A) ** 2 + (v - sunY) ** 2);
-            const rays = rayPattern * smoothstep(0.5, 0.08, rayDist) * smoothstep(0.04, 0.15, rayDist) * 0.35;
-
-            const sky = smoothstep(0.5, -0.4, v) * 0.18;
-
-            const cloud1x = u + t * 0.06;
-            const cloud1 = smoothstep(0.55, 0.65, vnoise(cloud1x * 3, v * 6))
-              * smoothstep(0.3, -0.1, v) * 0.25;
-            const cloud2x = u - t * 0.04 + 0.5;
-            const cloud2 = smoothstep(0.52, 0.62, vnoise(cloud2x * 4 + 10, v * 5 + 10))
-              * smoothstep(0.35, -0.15, v) * 0.2;
-
-            const horizon = smoothstep(0.04, 0.0, Math.abs(v - 0.3))
-              * (0.15 + Math.sin(u * 20 + t * 2) * 0.05);
-
-            const scatter = Math.max(0, 1 - rayDist / 0.6) * 0.08;
-
-            let val = sunCore + sunGlow + rays + sky + cloud1 + cloud2 + horizon + scatter;
-            row += charFor(Math.pow(sat(val), 0.7));
-          }
-          lines.push(row);
-        }
-        return lines;
-      },
-      color(x: number, y: number, ch: string, w: number, h: number): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        const u = x / w - 0.5, v = y / h - 0.5;
-        const sunDist = Math.sqrt(u * u * 4 + (v - 0.25) ** 2);
-
-        const blend = smoothstep(0.1, 0.4, sunDist);
-        const r = lerp(255, 100 + i * 80, blend) | 0;
-        const g = lerp(220, 150 + i * 60, blend) | 0;
-        const b = lerp(80, 190 + i * 65, blend) | 0;
-        return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
-      },
-      successColor(ch: string): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        return [200 + i * 55 | 0, 180 + i * 50 | 0, 80 + i * 60 | 0];
-      },
-      headerColor: [100, 170, 230],
-      titleColor: [255, 230, 120],
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [180 + i * 75 | 0, 110 + i * 80 | 0, 20 + i * 40 | 0];
     },
+    headerColor: [208, 140, 40],
+    titleColor: [255, 200, 60],
+  };
+}
 
-    custom: {
-      render(t: number, w: number, h: number): string[] {
-        const p = currentMode.params;
-        const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
-        const lines: string[] = [];
-        for (let y = 0; y < h; y++) {
-          let row = "";
-          for (let x = 0; x < w; x++) {
-            const u = x / w - 0.5, v = y / h - 0.5;
+function presetChill(): Preset {
+  return {
+    title: "c h i l l t i m e",
+    params: { state: true, dimming: 40, temp: 2700 },
+    desc: "40% brightness  ·  2700K warm white",
+    verify: (s) => s.state === true && s.dimming >= 38 && s.dimming <= 42 && s.temp === 2700,
+    tagline: "time to unwind",
+    helpText: "40% · 2700K — warm evening ambiance",
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
 
-            const swatchDist = sdBox(u, v, 0, 0, 0.3, 0.25);
-            const swatch = smoothstep(0.02, -0.01, swatchDist);
-            const swatchEdge = smoothstep(0.04, 0.01, swatchDist) * smoothstep(-0.01, 0.01, swatchDist);
+          const b1x = Math.sin(t * 0.4) * 0.2, b1y = Math.cos(t * 0.35) * 0.25;
+          const b2x = Math.cos(t * 0.3 + 2) * 0.25, b2y = Math.sin(t * 0.45 + 1) * 0.2;
+          const b3x = Math.sin(t * 0.5 + 4) * 0.15, b3y = Math.cos(t * 0.25 + 3) * 0.3;
 
-            const breathe = Math.sin(t * 1.5) * 0.06 + 0.94;
-            const inner = swatch * breathe;
+          const d1 = sdCircle(u, v, b1x, b1y, 0.12 + Math.sin(t * 0.7) * 0.03);
+          const d2 = sdCircle(u, v, b2x, b2y, 0.1 + Math.cos(t * 0.6) * 0.02);
+          const d3 = sdCircle(u, v, b3x, b3y, 0.08 + Math.sin(t * 0.8 + 2) * 0.025);
 
-            const rippleD = Math.max(0, swatchDist);
-            const ripple1 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15) % 0.4))) * 0.2;
-            const ripple2 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15 + 0.2) % 0.4))) * 0.15;
+          const k = 0.15;
+          const h1 = sat(0.5 + 0.5 * (d2 - d1) / k);
+          const m12 = d1 * h1 + d2 * (1 - h1) - k * h1 * (1 - h1);
+          const h2 = sat(0.5 + 0.5 * (d3 - m12) / k);
+          const merged = m12 * h2 + d3 * (1 - h2) - k * h2 * (1 - h2);
 
-            const glow = smoothstep(0.4, -0.05, swatchDist) * 0.15;
+          const blobVal = smoothstep(0.06, -0.04, merged);
+          const blobEdge = smoothstep(0.02, -0.01, merged) * 0.3;
 
-            const shimmer = swatch * (Math.sin((u + v) * 30 + t * 3) * 0.04 + 0.04);
+          const warmth = smoothstep(0.5, -0.3, v) * 0.2;
 
-            let val = inner * 0.7 + swatchEdge * 0.3 + ripple1 + ripple2 + glow + shimmer;
-            row += charFor(Math.pow(sat(val), 0.8));
-          }
-          lines.push(row);
+          const wave = (Math.sin(u * 8 + t * 0.8 + v * 4) * 0.5 + 0.5)
+            * (Math.cos(v * 6 - t * 0.5) * 0.5 + 0.5) * 0.15;
+
+          const flicker = vnoise(u * 3 + t * 0.5, v * 3 + t * 0.3) * 0.12;
+
+          const dist = Math.sqrt(u * u * 4 + v * v * 4);
+          const vignette = smoothstep(0.9, 0.3, dist);
+
+          let val = (blobVal * 0.6 + blobEdge + warmth + wave + flicker) * vignette;
+          row += charFor(Math.pow(sat(val), 0.75));
         }
-        return lines;
-      },
-      color(x: number, y: number, ch: string, w: number, h: number): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        const p = currentMode.params;
-        const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
-        const u = x / w - 0.5, v = y / h - 0.5;
-        const dist = Math.sqrt(u * u * 4 + v * v * 4);
-        const blend = smoothstep(0.3, 0.8, dist);
-        return [
-          lerp(cr * 0.5 + i * cr * 0.5, 80 + i * 60, blend) | 0,
-          lerp(cg * 0.5 + i * cg * 0.5, 70 + i * 50, blend) | 0,
-          lerp(cb * 0.5 + i * cb * 0.5, 60 + i * 40, blend) | 0,
-        ].map(v => Math.min(255, Math.max(0, v))) as RGB;
-      },
-      successColor(ch: string): RGB {
-        const i = ramp.indexOf(ch) / RL;
-        const p = currentMode.params;
-        const cr = p.r ?? 255, cg = p.g ?? 200, cb = p.b ?? 100;
-        return [
-          (cr * 0.4 + i * cr * 0.6) | 0,
-          (cg * 0.4 + i * cg * 0.6) | 0,
-          (cb * 0.4 + i * cb * 0.6) | 0,
-        ].map(v => Math.min(255, Math.max(0, v))) as RGB;
-      },
-      get headerColor(): RGB {
-        const p = currentMode.params;
-        return [p.r ?? 200, p.g ?? 160, p.b ?? 100].map(v => Math.floor(v * 0.6)) as RGB;
-      },
-      get titleColor(): RGB {
-        const p = currentMode.params;
-        return [p.r ?? 255, p.g ?? 200, p.b ?? 120] as RGB;
-      },
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const v = y / h;
+      const r = lerp(160, 220, i) + v * -20 | 0;
+      const g = lerp(80, 140, i) + v * -30 | 0;
+      const b = lerp(50, 80, i) + v * -20 | 0;
+      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [180 + i * 60 | 0, 120 + i * 50 | 0, 50 + i * 30 | 0];
+    },
+    headerColor: [210, 130, 70],
+    titleColor: [255, 180, 100],
+  };
+}
+
+function presetDay(): Preset {
+  return {
+    title: "d a y t i m e",
+    params: { state: true, dimming: 100, temp: 5000 },
+    desc: "100% brightness  ·  5000K daylight",
+    verify: (s) => s.state === true && s.dimming >= 98 && s.temp === 5000,
+    tagline: "let there be light",
+    helpText: "100% · 5000K — bright daylight",
+    render(t: number, w: number, h: number): string[] {
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+
+          const sunY = 0.25 - Math.sin(t * 0.3) * 0.05;
+          const sunDist = sdCircle(u, v, 0, sunY, 0.12);
+          const sunCore = smoothstep(0.01, -0.03, sunDist);
+          const sunGlow = smoothstep(0.25, -0.02, sunDist) * 0.5;
+
+          const angle = Math.atan2(v - sunY, u * A);
+          const rayCount = 12;
+          const rayAngle = ((angle / (2 * Math.PI)) * rayCount + t * 0.3) % 1;
+          const rayPattern = (Math.sin(rayAngle * Math.PI * 2) * 0.5 + 0.5);
+          const rayDist = Math.sqrt((u * A) ** 2 + (v - sunY) ** 2);
+          const rays = rayPattern * smoothstep(0.5, 0.08, rayDist) * smoothstep(0.04, 0.15, rayDist) * 0.35;
+
+          const sky = smoothstep(0.5, -0.4, v) * 0.18;
+
+          const cloud1x = u + t * 0.06;
+          const cloud1 = smoothstep(0.55, 0.65, vnoise(cloud1x * 3, v * 6))
+            * smoothstep(0.3, -0.1, v) * 0.25;
+          const cloud2x = u - t * 0.04 + 0.5;
+          const cloud2 = smoothstep(0.52, 0.62, vnoise(cloud2x * 4 + 10, v * 5 + 10))
+            * smoothstep(0.35, -0.15, v) * 0.2;
+
+          const horizon = smoothstep(0.04, 0.0, Math.abs(v - 0.3))
+            * (0.15 + Math.sin(u * 20 + t * 2) * 0.05);
+
+          const scatter = Math.max(0, 1 - rayDist / 0.6) * 0.08;
+
+          let val = sunCore + sunGlow + rays + sky + cloud1 + cloud2 + horizon + scatter;
+          row += charFor(Math.pow(sat(val), 0.7));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const u = x / w - 0.5, v = y / h - 0.5;
+      const sunDist = Math.sqrt(u * u * 4 + (v - 0.25) ** 2);
+
+      const blend = smoothstep(0.1, 0.4, sunDist);
+      const r = lerp(255, 100 + i * 80, blend) | 0;
+      const g = lerp(220, 150 + i * 60, blend) | 0;
+      const b = lerp(80, 190 + i * 65, blend) | 0;
+      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      return [200 + i * 55 | 0, 180 + i * 50 | 0, 80 + i * 60 | 0];
+    },
+    headerColor: [100, 170, 230],
+    titleColor: [255, 230, 120],
+  };
+}
+
+function createCustomPreset(params: WizPilotParams, title: string, desc: string): Preset {
+  return {
+    title,
+    params,
+    desc,
+    verify: (s) => s.state === true,
+    tagline: "looking good",
+    helpText: desc,
+    render(t: number, w: number, h: number): string[] {
+      const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
+      const lines: string[] = [];
+      for (let y = 0; y < h; y++) {
+        let row = "";
+        for (let x = 0; x < w; x++) {
+          const u = x / w - 0.5, v = y / h - 0.5;
+
+          const swatchDist = sdBox(u, v, 0, 0, 0.3, 0.25);
+          const swatch = smoothstep(0.02, -0.01, swatchDist);
+          const swatchEdge = smoothstep(0.04, 0.01, swatchDist) * smoothstep(-0.01, 0.01, swatchDist);
+
+          const breathe = Math.sin(t * 1.5) * 0.06 + 0.94;
+          const inner = swatch * breathe;
+
+          const rippleD = Math.max(0, swatchDist);
+          const ripple1 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15) % 0.4))) * 0.2;
+          const ripple2 = smoothstep(0.01, 0.0, Math.abs(rippleD - ((t * 0.15 + 0.2) % 0.4))) * 0.15;
+
+          const glow = smoothstep(0.4, -0.05, swatchDist) * 0.15;
+
+          const shimmer = swatch * (Math.sin((u + v) * 30 + t * 3) * 0.04 + 0.04);
+
+          let val = inner * 0.7 + swatchEdge * 0.3 + ripple1 + ripple2 + glow + shimmer;
+          row += charFor(Math.pow(sat(val), 0.8));
+        }
+        lines.push(row);
+      }
+      return lines;
+    },
+    color(x: number, y: number, ch: string, w: number, h: number): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
+      const u = x / w - 0.5, v = y / h - 0.5;
+      const dist = Math.sqrt(u * u * 4 + v * v * 4);
+      const blend = smoothstep(0.3, 0.8, dist);
+      return [
+        lerp(cr * 0.5 + i * cr * 0.5, 80 + i * 60, blend) | 0,
+        lerp(cg * 0.5 + i * cg * 0.5, 70 + i * 50, blend) | 0,
+        lerp(cb * 0.5 + i * cb * 0.5, 60 + i * 40, blend) | 0,
+      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+    },
+    successColor(ch: string): RGB {
+      const i = ramp.indexOf(ch) / RL;
+      const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
+      return [
+        (cr * 0.4 + i * cr * 0.6) | 0,
+        (cg * 0.4 + i * cg * 0.6) | 0,
+        (cb * 0.4 + i * cb * 0.6) | 0,
+      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+    },
+    get headerColor(): RGB {
+      return [params.r ?? 200, params.g ?? 160, params.b ?? 100].map(v => Math.floor(v * 0.6)) as RGB;
+    },
+    get titleColor(): RGB {
+      return [params.r ?? 255, params.g ?? 200, params.b ?? 120] as RGB;
+    },
+  };
+}
+
+const PRESET_FACTORIES: Record<string, () => Preset> = {
+  movie: presetMovie,
+  chill: presetChill,
+  day: presetDay,
+};
+
+function resolvePreset(args = process.argv.slice(2)): ResolvedPreset | null {
+  let modeName: string | null = null;
+  let hexColor: string | null = null;
+  let brightness: number | null = null;
+
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i];
+    const a = raw.replace(/^-+/, "");
+
+    if (a in PRESET_FACTORIES) {
+      modeName = a;
+    } else if (a === "color" || a === "c") {
+      hexColor = args[++i];
+    } else if (a === "brightness" || a === "bright" || a === "b" || a === "dim") {
+      brightness = parseInt(args[++i], 10);
+    } else if (/^[0-9a-fA-F]{3,6}$/.test(a) || /^#[0-9a-fA-F]{3,6}$/.test(raw)) {
+      hexColor = a.replace(/^#/, "");
+    } else if (/^\d+%?$/.test(a)) {
+      brightness = parseInt(a, 10);
+    }
+  }
+
+  if (hexColor) {
+    hexColor = hexColor.replace(/^#/, "");
+    if (hexColor.length === 3) hexColor = hexColor.split("").map(c => c + c).join("");
+    if (!/^[0-9a-fA-F]{6}$/.test(hexColor)) {
+      console.error(`\x1b[31m  invalid hex color: ${hexColor}\x1b[0m`);
+      process.exit(1);
+    }
+  }
+
+  if (brightness !== null && (isNaN(brightness) || brightness < 1 || brightness > 100)) {
+    console.error(`\x1b[31m  brightness must be 1-100\x1b[0m`);
+    process.exit(1);
+  }
+
+  if (!modeName && (hexColor || brightness !== null)) {
+    const r = hexColor ? parseInt(hexColor.slice(0, 2), 16) : null;
+    const g = hexColor ? parseInt(hexColor.slice(2, 4), 16) : null;
+    const b = hexColor ? parseInt(hexColor.slice(4, 6), 16) : null;
+    const dim = brightness ?? 100;
+
+    const params: WizPilotParams = { state: true, dimming: dim };
+    if (hexColor) {
+      params.r = r!;
+      params.g = g!;
+      params.b = b!;
+      params.w = 0;
+      params.c = 0;
+    }
+
+    const desc = hexColor
+      ? `${dim}% brightness  ·  rgb(${r}, ${g}, ${b})`
+      : `${dim}% brightness`;
+
+    return {
+      name: "custom",
+      preset: createCustomPreset(params, hexColor ? `# ${hexColor.toUpperCase()}` : `${dim} %`, desc),
+    };
+  }
+
+  if (!modeName) return null;
+
+  const factory = PRESET_FACTORIES[modeName];
+  if (!factory) return null;
+
+  const preset = factory();
+  if (brightness === null) return { name: modeName, preset };
+
+  return {
+    name: modeName,
+    preset: {
+      ...preset,
+      params: { ...preset.params, dimming: brightness },
+      desc: preset.desc.replace(/\d+% brightness/, `${brightness}% brightness`),
     },
   };
 }
@@ -617,24 +648,24 @@ function successFrame(t: number, w: number, h: number): string[] {
 // -- renderer --
 
 class Renderer {
-  private shader: Shader;
+  private preset: Preset;
   private modeTitle: string;
   started = false;
   interval: ReturnType<typeof setInterval> | null = null;
   t = 0;
   statusLines: string[] = [];
 
-  constructor(shader: Shader, modeTitle: string) {
-    this.shader = shader;
-    this.modeTitle = modeTitle;
+  constructor(preset: Preset) {
+    this.preset = preset;
+    this.modeTitle = preset.title;
   }
 
   start() {
     process.stdout.write(hide);
     const title = `  ${this.modeTitle}  `;
     const pad = Math.max(0, Math.floor((W - title.length) / 2));
-    const [hr, hg, hb] = this.shader.headerColor;
-    const [tr, tg, tb] = this.shader.titleColor;
+    const [hr, hg, hb] = this.preset.headerColor;
+    const [tr, tg, tb] = this.preset.titleColor;
     process.stdout.write("\n");
     process.stdout.write(`  ${rgb(hr, hg, hb, "~".repeat(W))}\n`);
     process.stdout.write(`  ${" ".repeat(pad)}${bold(rgb(tr, tg, tb, title))}\n`);
@@ -648,13 +679,13 @@ class Renderer {
   }
 
   _drawShader() {
-    const lines = this.shader.render(this.t, W, H);
+    const lines = this.preset.render(this.t, W, H);
     for (let y = 0; y < lines.length; y++) {
       let out = "";
       for (let x = 0; x < lines[y].length; x++) {
         const ch = lines[y][x];
         if (ch === " " || ch === "`") { out += ch; continue; }
-        const [r, g, b] = this.shader.color(x, y, ch, W, H);
+        const [r, g, b] = this.preset.color(x, y, ch, W, H);
         out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
       }
       process.stdout.write(`  ${out}\n`);
@@ -687,7 +718,7 @@ class Renderer {
           for (let x = 0; x < lines[y].length; x++) {
             const ch = lines[y][x];
             if (ch === " " || ch === "`") { out += ch; continue; }
-            const [r, g, b] = this.shader.successColor(ch);
+            const [r, g, b] = this.preset.successColor(ch);
             out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
           }
           process.stdout.write(`  ${out}\n`);
@@ -1206,70 +1237,108 @@ async function cmdStatus() {
   console.log();
 }
 
+function makePresetExecutionError(
+  code: PresetExecutionErrorCode,
+  macFmt: string,
+  opts?: { ip?: string; detail?: string }
+): PresetExecutionError {
+  const err = new Error(opts?.detail ?? code) as PresetExecutionError;
+  err.code = code;
+  err.macFmt = macFmt;
+  err.ip = opts?.ip;
+  err.detail = opts?.detail;
+  return err;
+}
+
+async function executePreset(
+  mac: string,
+  preset: Preset,
+  name: string,
+  onStatus: (lines: string[]) => void
+): Promise<ExecutePresetResult> {
+  const macFmt = formatMac(mac);
+
+  let ip: string;
+  try {
+    ip = await requireBulbIp(mac, { onStatus });
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg === "no network interface found") throw makePresetExecutionError("no_network", macFmt);
+    throw makePresetExecutionError("bulb_not_found", macFmt);
+  }
+
+  onStatus([green(`found bulb at ${ip}`), dim(`mac ${macFmt}`), dim(`setting ${name} mode...`)]);
+
+  let prevState: WizResponse | undefined;
+  try {
+    prevState = await sendWithRetry(ip, { method: "getPilot", params: {} });
+  } catch {
+    onStatus([green(`found bulb at ${ip}`), yellow("could not read current state"), dim(`setting ${name} mode...`)]);
+  }
+
+  let resp: WizResponse;
+  try {
+    resp = await sendWithRetry(ip, { method: "setPilot", params: preset.params });
+  } catch (e) {
+    throw makePresetExecutionError("set_failed", macFmt, { ip, detail: (e as Error).message });
+  }
+
+  if (!resp.result?.success) {
+    throw makePresetExecutionError("rejected", macFmt, { ip, detail: JSON.stringify(resp).slice(0, 60) });
+  }
+
+  let verified = false;
+  try {
+    const current = await sendWithRetry(ip, { method: "getPilot", params: {} });
+    verified = preset.verify(current.result as WizPilotState);
+  } catch {}
+
+  return { ip, macFmt, prevState, verified };
+}
+
 async function cmdAnimatedPreset() {
-  const mac = requireMac();
-
-  const { modeName: arg } = parseArgs();
-  const mode = arg ? MODES[arg] : null;
-
-  if (!mode) {
+  const resolved = resolvePreset();
+  if (!resolved) {
     showHelp(1);
     return;
   }
 
-  const shaders = createShaders(mode);
-  const shader = shaders[arg!] || shaders.chill;
+  const { name, preset } = resolved;
+  const mac = requireMac();
 
-  const r = new Renderer(shader, mode.title);
+  const r = new Renderer(preset);
   process.on("SIGINT", () => { r.stop(); process.exit(130); });
   process.on("SIGTERM", () => { r.stop(); process.exit(143); });
 
   r.start();
 
-  const macFmt = formatMac(mac);
-  let ip: string;
+  let result: ExecutePresetResult;
   try {
-    ip = await requireBulbIp(mac, { onStatus: (lines) => r.setStatus(lines) });
+    result = await executePreset(mac, preset, name, (lines) => r.setStatus(lines));
   } catch (e) {
-    const msg = (e as Error).message;
-    if (msg === "no network interface found") {
+    const err = e as PresetExecutionError;
+    if (err.code === "no_network") {
       r.setStatus([red("no network interface found"), "", dim("check that wi-fi is connected")]);
+    } else if (err.code === "bulb_not_found") {
+      r.setStatus([red("bulb not found on network"), "", dim("is it powered on? same wi-fi?"), dim(`mac ${err.macFmt}`)]);
+    } else if (err.code === "set_failed") {
+      r.setStatus([green(`found bulb at ${err.ip ?? "unknown"}`), red(`failed: ${err.detail}`), "", dim("try power-cycling the bulb")]);
+    } else if (err.code === "rejected") {
+      r.setStatus([green(`found bulb at ${err.ip ?? "unknown"}`), red("bulb rejected command"), dim(err.detail ?? "")]);
     } else {
-      r.setStatus([red("bulb not found on network"), "", dim("is it powered on? same wi-fi?"), dim(`mac ${macFmt}`)]);
+      r.setStatus([red("failed to set preset"), dim((e as Error).message)]);
     }
     await sleep(2000); r.stop(); process.exit(1);
   }
 
-  r.setStatus([green(`found bulb at ${ip}`), dim(`mac ${macFmt}`), dim(`setting ${arg} mode...`)]);
-
-  let state: WizResponse | undefined;
-  try { state = await sendWithRetry(ip, { method: "getPilot", params: {} }); }
-  catch { r.setStatus([green(`found bulb at ${ip}`), yellow("could not read current state"), dim(`setting ${arg} mode...`)]); }
-
-  let resp: WizResponse;
-  try { resp = await sendWithRetry(ip, { method: "setPilot", params: mode.params }); }
-  catch (e) {
-    r.setStatus([green(`found bulb at ${ip}`), red(`failed: ${(e as Error).message}`), "", dim("try power-cycling the bulb")]);
-    await sleep(2000); r.stop(); process.exit(1);
-  }
-
-  if (!resp.result?.success) {
-    r.setStatus([green(`found bulb at ${ip}`), red("bulb rejected command"), dim(JSON.stringify(resp).slice(0, 60))]);
-    await sleep(2000); r.stop(); process.exit(1);
-  }
-
-  let verified: boolean;
-  try { const c = await sendWithRetry(ip, { method: "getPilot", params: {} }); verified = mode.verify(c.result as WizPilotState); }
-  catch { verified = false; }
-
-  const prev = state?.result;
+  const prev = result.prevState?.result;
   const prevDesc = prev
     ? dim(`was: ${prev.state ? "on" : "off"}, ${prev.dimming ?? "?"}%, ${prev.temp ?? [prev.r, prev.g, prev.b].join("/")}`)
     : "";
 
   r.setStatus([
-    verified ? green(`${arg} mode active`) : yellow(`${arg} mode sent (unverified)`),
-    dim(mode.desc), prevDesc, verified ? dim(mode.tagline) : "",
+    result.verified ? green(`${name} mode active`) : yellow(`${name} mode sent (unverified)`),
+    dim(preset.desc), prevDesc, result.verified ? dim(preset.tagline) : "",
   ].filter(Boolean));
 
   await r.finish(true);
@@ -1278,20 +1347,61 @@ async function cmdAnimatedPreset() {
 
 // -- help --
 
+const COMMANDS: Command[] = [
+  {
+    aliases: ["discover", "scan"],
+    usage: "wiz discover",
+    desc: "scan network and pick your bulb",
+    run: cmdDiscover,
+  },
+  {
+    aliases: ["on"],
+    usage: "wiz on",
+    desc: "turn light on",
+    run: cmdOn,
+  },
+  {
+    aliases: ["off"],
+    usage: "wiz off",
+    desc: "turn light off",
+    run: cmdOff,
+  },
+  {
+    aliases: ["status"],
+    usage: "wiz status",
+    desc: "show current bulb state",
+    run: cmdStatus,
+  },
+  {
+    aliases: ["help", "h"],
+    usage: "wiz help",
+    desc: "show this help",
+    run: () => showHelp(0),
+    showInHelp: false,
+  },
+];
+
 function showHelp(exitCode: number): never {
   const c = (s: string) => `\x1b[33m${s}\x1b[0m`;
   const d = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  const commandRows = COMMANDS.filter((cmd) => cmd.showInHelp !== false);
+  const commandWidth = Math.max(...commandRows.map((cmd) => cmd.usage.length)) + 4;
+  const presetRows = Object.entries(PRESET_FACTORIES).map(([name, factory]) => ({
+    usage: `wiz -${name}`,
+    desc: factory().helpText,
+  }));
+  const presetWidth = Math.max(...presetRows.map((row) => row.usage.length)) + 4;
+
   console.log(`\n  ${c("wiz")} — control your wiz light\n`);
   console.log(`  commands:`);
-  console.log(`    ${c("wiz discover")}    ${d("scan network and pick your bulb")}`);
-  console.log(`    ${c("wiz on")}          ${d("turn light on")}`);
-  console.log(`    ${c("wiz off")}         ${d("turn light off")}`);
-  console.log(`    ${c("wiz status")}      ${d("show current bulb state")}`);
+  for (const row of commandRows) {
+    console.log(`    ${c(row.usage.padEnd(commandWidth))}${d(row.desc)}`);
+  }
   console.log();
   console.log(`  presets:`);
-  console.log(`    ${c("wiz -movie")}      ${d("1% · 2200K  — pico projector darkness")}`);
-  console.log(`    ${c("wiz -chill")}      ${d("40% · 2700K — warm evening ambiance")}`);
-  console.log(`    ${c("wiz -day")}        ${d("100% · 5000K — bright daylight")}`);
+  for (const row of presetRows) {
+    console.log(`    ${c(row.usage.padEnd(presetWidth))}${d(row.desc)}`);
+  }
   console.log();
   console.log(`  custom:`);
   console.log(`    ${c("wiz ff6b35")}      ${d("set color by hex")}`);
@@ -1315,17 +1425,10 @@ function showWelcome(): never {
 // -- entry point --
 
 const subcmd = process.argv[2]?.replace(/^-+/, "");
+const cmd = subcmd ? COMMANDS.find((entry) => entry.aliases.includes(subcmd)) : null;
 
-if (subcmd === "discover" || subcmd === "scan") {
-  cmdDiscover();
-} else if (subcmd === "off") {
-  cmdOff();
-} else if (subcmd === "on") {
-  cmdOn();
-} else if (subcmd === "status") {
-  cmdStatus();
-} else if (subcmd === "help" || subcmd === "h") {
-  showHelp(0);
+if (cmd) {
+  void cmd.run();
 } else if (!process.argv[2] && (!envLoaded || !process.env.WIZ_MAC || process.env.WIZ_MAC === "your_bulb_mac_here")) {
   showWelcome();
 } else {

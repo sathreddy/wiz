@@ -20,7 +20,7 @@ Everything lives in one file, organized top-to-bottom:
 8. Helpers — `saveEnv`, `formatMac`, `describeState`, `promptInput`
 9. Network — UDP send/receive, broadcast discovery, subnet scan fallback, retry logic
 10. Discover-all primitives — `discoverAll` (broadcast), `discoverAllSubnetScan`, `getSystemConfig`
-11. Guards — `requireMac()`, `requireBulbIp(mac)` with cached IP fast path
+11. Guards — `requireMac()`, `requireBulbIp(mac, opts?)` with cached IP fast path and optional `onStatus` callback for renderer integration
 12. Commands — `cmdDiscover`, `cmdOn`, `cmdOff`, `cmdStatus`, `cmdAnimatedPreset`
 13. Command router — entry point, dispatches based on `process.argv[2]`
 
@@ -39,7 +39,7 @@ Everything lives in one file, organized top-to-bottom:
 - No external dependencies — only `node:dgram`, `node:os`, `node:fs`, `node:path`, `node:url`
 - ASCII rendering uses a 92-character density ramp with per-character true-color ANSI
 - Shaders are SDF-based: signed distance functions for shapes, smoothstep for blending
-- Network discovery: broadcast first, subnet scan fallback (batches of 30)
+- Network discovery: races broadcast + subnet scan (500ms head start for broadcast, batches of 50)
 - All timeouts/retries are configurable via constants at the top
 
 ## Files
@@ -47,7 +47,7 @@ Everything lives in one file, organized top-to-bottom:
 | File | Purpose |
 |------|---------|
 | `wiz` | The entire app — executable Bun script |
-| `.env` | `WIZ_MAC=<mac>` + `WIZ_IP=<ip>` — not committed, written by `wiz discover` |
+| `.env` | `WIZ_MAC`, `WIZ_IP`, `WIZ_SKIP_BROADCAST` — not committed, written by `wiz discover` and discovery fallback |
 | `env.example` | Template for `.env` |
 | `.gitignore` | Ignores `.env` and `node_modules/` |
 

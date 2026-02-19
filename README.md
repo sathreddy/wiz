@@ -1,68 +1,103 @@
 # wiz
 
-CLI to control Wiz smart lights over your local network. Built with [Bun](https://bun.sh).
+Control your [Wiz](https://www.wizconnected.com/) smart lights from the terminal. Each mode plays a unique ASCII animation while it sets the light.
 
-Each mode plays a unique ASCII shader animation in your terminal while setting the light.
+Single file, no dependencies, runs on [Bun](https://bun.sh).
 
-## Setup
+## Getting started
+
+### 1. Install Bun
 
 ```sh
-# symlink into your PATH
-ln -s "$(pwd)/wiz.ts" ~/bin/wiz
+brew install oven-sh/bun/bun
+```
 
-# discover your bulb and save config
+Or see [bun.sh](https://bun.sh) for other install methods.
+
+### 2. Clone this repo
+
+```sh
+git clone https://github.com/sathreddy/wiz.git
+cd wiz
+```
+
+### 3. Add `wiz` to your PATH
+
+```sh
+ln -s "$(pwd)/wiz.ts" ~/bin/wiz
+```
+
+> Make sure `~/bin` is in your PATH. If it isn't, add `export PATH="$HOME/bin:$PATH"` to your `~/.zshrc` (or `~/.bashrc`), then restart your terminal.
+
+### 4. Find your bulb
+
+Make sure your Wiz bulb is powered on and connected to the same Wi-Fi network as your computer, then run:
+
+```sh
 wiz discover
 ```
 
-Requires [Bun](https://bun.sh) (`brew install oven-sh/bun/bun`).
+This scans your network, shows a table of bulbs it finds, and lets you pick one to save as your default. You only need to do this once.
 
 ## Usage
 
-### Commands
-
-```sh
-wiz discover        # scan network, pick your bulb, save to .env
-wiz on              # turn light on
-wiz off             # turn light off
-wiz status          # show current bulb state
-```
-
 ### Presets
 
-Each preset plays a unique ASCII shader animation while setting the light.
+```sh
+wiz -movie          # 1% brightness, 2200K — movie time
+wiz -chill          # 40% brightness, 2700K — warm evening
+wiz -day            # 100% brightness, 5000K — bright daylight
+```
 
-| Mode | Brightness | Temp | Use case |
-|------|-----------|------|----------|
-| `-movie` | 1% | 2200K | Pico projector darkness |
-| `-chill` | 40% | 2700K | Warm evening ambiance |
-| `-day` | 100% | 5000K | Bright daylight |
-
-### Custom
+### Basics
 
 ```sh
-wiz ff6b35          # set color by hex
+wiz on              # turn light on (restores previous setting)
+wiz off             # turn light off
+wiz status          # show current brightness, color, and power state
+```
+
+### Custom colors and brightness
+
+```sh
+wiz ff6b35          # set color by hex code
 wiz ff6b35 50       # hex color at 50% brightness
-wiz -b 75           # brightness only (1-100)
+wiz -b 75           # just set brightness (1-100)
 wiz -chill -b 60    # preset with brightness override
 ```
 
+## Network troubleshooting
+
+`wiz` talks to your bulb over your local Wi-Fi — no cloud, no internet required. But some routers make this harder than it should be.
+
+**Common issues:**
+
+- **Bulb not found?** Make sure the bulb is on the same Wi-Fi network. Wiz bulbs only connect to 2.4GHz, so if your computer is on 5GHz, your router needs to allow cross-band traffic.
+- **Discovery is slow?** Some routers block UDP broadcast between devices. `wiz` automatically falls back to scanning your subnet directly. After the first successful scan, it remembers the bulb's IP so future commands are instant.
+- **Router in "Route" mode?** Some ISP-provided routers (Airtel GPON, etc.) default to a mode that isolates devices from each other. Look for a "Port Mode" or "AP Isolation" setting and switch it to Bridge mode.
+
+If discovery keeps failing, try `wiz discover` after power-cycling the bulb.
+
+## Make it your own
+
+This is a single-file script — everything lives in `wiz.ts`. Fork this repo and customize it however you want:
+
+- **Add your own presets** — the `MODES` object near the top of the file defines each preset's brightness, color temperature, and the ASCII animation it plays. Copy one and tweak the values.
+- **Change the animations** — each preset has a shader function that draws the terminal animation frame-by-frame. They use simple math (sine waves, circles, noise) — no graphics libraries.
+- **Add new commands** — the command router at the bottom of the file dispatches based on the first argument. Add a new `else if` branch and a command function.
+- **Control multiple bulbs** — the `.env` file stores one bulb's MAC and IP. You could extend it to support named bulbs, rooms, or groups.
+
+### Project structure
+
+| File | What it does |
+|------|-------------|
+| `wiz.ts` | The entire app — one executable script |
+| `.env` | Your bulb's MAC address and IP (created by `wiz discover`, not committed) |
+| `env.example` | Template showing the available config variables |
+
 ## How it works
 
-1. Discovers bulb on the local network by MAC address (UDP broadcast, falls back to subnet scan)
-2. Sends `setPilot` command via Wiz JSON-RPC protocol (UDP port 38899)
-3. Verifies state with `getPilot`, retries on failure (3x with 500ms delay)
-
-## Protocol
-
-Wiz bulbs speak a JSON-RPC protocol over UDP on port 38899. Key commands:
-
-- `registration` — discover bulbs via broadcast
-- `getPilot` — read current light state
-- `setPilot` — set color, temperature, brightness, power
-- `getSystemConfig` — read MAC, firmware, module info
-
-Quirks:
-- RGB mode: must send `w: 0, c: 0` or white LEDs contaminate the color
-- RGB mode minimum dimming is 10; color temp mode accepts dimming as low as 1
-- Never send `temp` and `r/g/b` in the same command
-- `dimming: 0` does not turn off the light — use `state: false`
+1. Checks for a cached bulb IP in `.env` — if it responds, uses it instantly
+2. Otherwise races a UDP broadcast against a subnet scan to find the bulb by MAC address
+3. Sends commands via the Wiz JSON-RPC protocol (UDP port 38899)
+4. Verifies the bulb state after each command and retries on failure

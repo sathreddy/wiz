@@ -61,9 +61,9 @@ interface Preset {
   verify: (s: WizPilotState) => boolean;
   tagline: string;
   helpText: string;
-  render(t: number, w: number, h: number): string[];
-  color(x: number, y: number, ch: string, w: number, h: number): RGB;
-  successColor(ch: string): RGB;
+  renderIntensity(t: number, w: number, h: number): Float32Array;
+  colorFromIntensity(x: number, y: number, i: number, w: number, h: number): RGB;
+  successColorFromIntensity(i: number): RGB;
   headerColor: RGB;
   titleColor: RGB;
 }
@@ -124,8 +124,8 @@ const RETRY_DELAY_MS = 500;
 
 // -- terminal --
 
-const cols = process.stdout.columns || 60;
-const W = Math.min(cols - 4, 62);
+const MAX_W = 62;
+const MIN_W = 20;
 const H = 14;
 const hide = "\x1b[?25l";
 const show = "\x1b[?25h";
@@ -143,6 +143,11 @@ const rgb = (r: number, g: number, b: number, s: string) => `\x1b[38;2;${r};${g}
 const ramp = " `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@";
 const RL = ramp.length;
 const A = 2.0;
+
+function getViewportWidth(): number {
+  const cols = process.stdout.columns || 60;
+  return Math.min(MAX_W, Math.max(MIN_W, cols - 4));
+}
 
 function smoothstep(e0: number, e1: number, x: number): number {
   const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
@@ -180,6 +185,7 @@ function vnoise(x: number, y: number): number {
 }
 
 function sat(v: number): number { return Math.max(0, Math.min(1, v)); }
+function clampByte(v: number): number { return Math.max(0, Math.min(255, v | 0)); }
 function charFor(v: number): string { return ramp[Math.floor(sat(v) * (RL - 1))]; }
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
 
@@ -204,9 +210,8 @@ function presetMovie(): Preset {
     verify: (s) => s.state === true && s.dimming <= 2 && s.temp === 2200,
     tagline: "enjoy the movie",
     helpText: "1% · 2200K  — pico projector darkness",
-    render(t: number, w: number, h: number): string[] {
-      const lines: string[] = [];
-
+    renderIntensity(t: number, w: number, h: number): Float32Array {
+      const out = new Float32Array(w * h);
       const pEmber    = smoothstep(0.0, 1.2, t);
       const pIgnite   = smoothstep(1.0, 2.0, t);
       const pBeamGrow = smoothstep(1.8, 4.0, t);
@@ -222,8 +227,8 @@ function presetMovie(): Preset {
       const bnx = bx / bLen, bny = by / bLen;
 
       for (let y = 0; y < h; y++) {
-        let row = "";
         for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
           const u = x / w - 0.5, v = y / h - 0.5;
           let val = 0;
 
@@ -305,14 +310,12 @@ function presetMovie(): Preset {
           val += scan * beam;
           val += grain * Math.max(beam, screen * 0.5);
 
-          row += charFor(Math.pow(sat(val), 0.85));
+          out[idx] = Math.pow(sat(val), 0.85);
         }
-        lines.push(row);
       }
-      return lines;
+      return out;
     },
-    color(x: number, y: number, ch: string, w: number, h: number): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    colorFromIntensity(x: number, y: number, i: number, w: number, h: number): RGB {
       const u = x / w, v = y / h;
       if (v < 0.15 && u > 0.2 && u < 0.8 && i > 0.1)
         return [140 + i * 115 | 0, 150 + i * 105 | 0, 180 + i * 75 | 0];
@@ -324,8 +327,7 @@ function presetMovie(): Preset {
         return [110 + i * 145 | 0, 85 + i * 105 | 0, 40 + i * 55 | 0];
       return [70 + i * 100 | 0, 60 + i * 80 | 0, 35 + i * 50 | 0];
     },
-    successColor(ch: string): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    successColorFromIntensity(i: number): RGB {
       return [180 + i * 75 | 0, 110 + i * 80 | 0, 20 + i * 40 | 0];
     },
     headerColor: [208, 140, 40],
@@ -341,11 +343,11 @@ function presetChill(): Preset {
     verify: (s) => s.state === true && s.dimming >= 38 && s.dimming <= 42 && s.temp === 2700,
     tagline: "time to unwind",
     helpText: "40% · 2700K — warm evening ambiance",
-    render(t: number, w: number, h: number): string[] {
-      const lines: string[] = [];
+    renderIntensity(t: number, w: number, h: number): Float32Array {
+      const out = new Float32Array(w * h);
       for (let y = 0; y < h; y++) {
-        let row = "";
         for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
           const u = x / w - 0.5, v = y / h - 0.5;
 
           const b1x = Math.sin(t * 0.4) * 0.2, b1y = Math.cos(t * 0.35) * 0.25;
@@ -376,22 +378,19 @@ function presetChill(): Preset {
           const vignette = smoothstep(0.9, 0.3, dist);
 
           let val = (blobVal * 0.6 + blobEdge + warmth + wave + flicker) * vignette;
-          row += charFor(Math.pow(sat(val), 0.75));
+          out[idx] = Math.pow(sat(val), 0.75);
         }
-        lines.push(row);
       }
-      return lines;
+      return out;
     },
-    color(x: number, y: number, ch: string, w: number, h: number): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    colorFromIntensity(x: number, y: number, i: number, w: number, h: number): RGB {
       const v = y / h;
       const r = lerp(160, 220, i) + v * -20 | 0;
       const g = lerp(80, 140, i) + v * -30 | 0;
       const b = lerp(50, 80, i) + v * -20 | 0;
-      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+      return [clampByte(r), clampByte(g), clampByte(b)];
     },
-    successColor(ch: string): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    successColorFromIntensity(i: number): RGB {
       return [180 + i * 60 | 0, 120 + i * 50 | 0, 50 + i * 30 | 0];
     },
     headerColor: [210, 130, 70],
@@ -407,11 +406,11 @@ function presetDay(): Preset {
     verify: (s) => s.state === true && s.dimming >= 98 && s.temp === 5000,
     tagline: "let there be light",
     helpText: "100% · 5000K — bright daylight",
-    render(t: number, w: number, h: number): string[] {
-      const lines: string[] = [];
+    renderIntensity(t: number, w: number, h: number): Float32Array {
+      const out = new Float32Array(w * h);
       for (let y = 0; y < h; y++) {
-        let row = "";
         for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
           const u = x / w - 0.5, v = y / h - 0.5;
 
           const sunY = 0.25 - Math.sin(t * 0.3) * 0.05;
@@ -441,14 +440,12 @@ function presetDay(): Preset {
           const scatter = Math.max(0, 1 - rayDist / 0.6) * 0.08;
 
           let val = sunCore + sunGlow + rays + sky + cloud1 + cloud2 + horizon + scatter;
-          row += charFor(Math.pow(sat(val), 0.7));
+          out[idx] = Math.pow(sat(val), 0.7);
         }
-        lines.push(row);
       }
-      return lines;
+      return out;
     },
-    color(x: number, y: number, ch: string, w: number, h: number): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    colorFromIntensity(x: number, y: number, i: number, w: number, h: number): RGB {
       const u = x / w - 0.5, v = y / h - 0.5;
       const sunDist = Math.sqrt(u * u * 4 + (v - 0.25) ** 2);
 
@@ -456,10 +453,9 @@ function presetDay(): Preset {
       const r = lerp(255, 100 + i * 80, blend) | 0;
       const g = lerp(220, 150 + i * 60, blend) | 0;
       const b = lerp(80, 190 + i * 65, blend) | 0;
-      return [sat(r / 255) * 255 | 0, sat(g / 255) * 255 | 0, sat(b / 255) * 255 | 0];
+      return [clampByte(r), clampByte(g), clampByte(b)];
     },
-    successColor(ch: string): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    successColorFromIntensity(i: number): RGB {
       return [200 + i * 55 | 0, 180 + i * 50 | 0, 80 + i * 60 | 0];
     },
     headerColor: [100, 170, 230],
@@ -475,12 +471,11 @@ function createCustomPreset(params: WizPilotParams, title: string, desc: string)
     verify: (s) => s.state === true,
     tagline: "looking good",
     helpText: desc,
-    render(t: number, w: number, h: number): string[] {
-      const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
-      const lines: string[] = [];
+    renderIntensity(t: number, w: number, h: number): Float32Array {
+      const out = new Float32Array(w * h);
       for (let y = 0; y < h; y++) {
-        let row = "";
         for (let x = 0; x < w; x++) {
+          const idx = y * w + x;
           const u = x / w - 0.5, v = y / h - 0.5;
 
           const swatchDist = sdBox(u, v, 0, 0, 0.3, 0.25);
@@ -499,14 +494,12 @@ function createCustomPreset(params: WizPilotParams, title: string, desc: string)
           const shimmer = swatch * (Math.sin((u + v) * 30 + t * 3) * 0.04 + 0.04);
 
           let val = inner * 0.7 + swatchEdge * 0.3 + ripple1 + ripple2 + glow + shimmer;
-          row += charFor(Math.pow(sat(val), 0.8));
+          out[idx] = Math.pow(sat(val), 0.8);
         }
-        lines.push(row);
       }
-      return lines;
+      return out;
     },
-    color(x: number, y: number, ch: string, w: number, h: number): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    colorFromIntensity(x: number, y: number, i: number, w: number, h: number): RGB {
       const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
       const u = x / w - 0.5, v = y / h - 0.5;
       const dist = Math.sqrt(u * u * 4 + v * v * 4);
@@ -515,16 +508,15 @@ function createCustomPreset(params: WizPilotParams, title: string, desc: string)
         lerp(cr * 0.5 + i * cr * 0.5, 80 + i * 60, blend) | 0,
         lerp(cg * 0.5 + i * cg * 0.5, 70 + i * 50, blend) | 0,
         lerp(cb * 0.5 + i * cb * 0.5, 60 + i * 40, blend) | 0,
-      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+      ].map(v => clampByte(v)) as RGB;
     },
-    successColor(ch: string): RGB {
-      const i = ramp.indexOf(ch) / RL;
+    successColorFromIntensity(i: number): RGB {
       const cr = params.r ?? 255, cg = params.g ?? 200, cb = params.b ?? 100;
       return [
         (cr * 0.4 + i * cr * 0.6) | 0,
         (cg * 0.4 + i * cg * 0.6) | 0,
         (cb * 0.4 + i * cb * 0.6) | 0,
-      ].map(v => Math.min(255, Math.max(0, v))) as RGB;
+      ].map(v => clampByte(v)) as RGB;
     },
     get headerColor(): RGB {
       return [params.r ?? 200, params.g ?? 160, params.b ?? 100].map(v => Math.floor(v * 0.6)) as RGB;
@@ -622,11 +614,11 @@ function resolvePreset(args = process.argv.slice(2)): ResolvedPreset | null {
 
 // -- shared success frame --
 
-function successFrame(t: number, w: number, h: number): string[] {
-  const lines: string[] = [];
+function successFrameIntensity(t: number, w: number, h: number): Float32Array {
+  const out = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
-    let row = "";
     for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
       const u = x / w - 0.5, v = y / h - 0.5;
       const breathe = Math.sin(t * 1.8) * 0.08;
       const orbDist = sdCircle(u, v, 0, 0, 0.18 + breathe);
@@ -638,11 +630,10 @@ function successFrame(t: number, w: number, h: number): string[] {
       const rays = (Math.sin(angle * 6 + t * 1.2) * 0.5 + 0.5) * smoothstep(0.35, 0.05, -orbDist) * 0.25;
       const shimmer = (noise(u + t * 0.05, v - t * 0.03) - 0.5) * 0.06 * glow;
       let val = core + glow + ring1 + ring2 + rays + shimmer;
-      row += charFor(Math.pow(sat(val), 0.8));
+      out[idx] = Math.pow(sat(val), 0.8);
     }
-    lines.push(row);
   }
-  return lines;
+  return out;
 }
 
 // -- renderer --
@@ -650,87 +641,191 @@ function successFrame(t: number, w: number, h: number): string[] {
 class Renderer {
   private preset: Preset;
   private modeTitle: string;
+  private width: number;
+  private readonly frameRows = H + 10;
+  private startMs = 0;
+  private hasFrame = false;
+  private rendering = false;
+  private pendingRedraw = false;
+  private statusLines: string[] = [];
+  private readonly onResize: () => void;
   started = false;
   interval: ReturnType<typeof setInterval> | null = null;
   t = 0;
-  statusLines: string[] = [];
 
   constructor(preset: Preset) {
     this.preset = preset;
     this.modeTitle = preset.title;
+    this.width = getViewportWidth();
+    this.onResize = () => {
+      const nextWidth = getViewportWidth();
+      if (nextWidth !== this.width) {
+        this.width = nextWidth;
+        this.requestRedraw();
+      }
+    };
+  }
+
+  private headerBlock(): string {
+    const title = `  ${this.modeTitle}  `;
+    const pad = Math.max(0, Math.floor((this.width - title.length) / 2));
+    const [hr, hg, hb] = this.preset.headerColor;
+    const [tr, tg, tb] = this.preset.titleColor;
+    return [
+      "",
+      `  ${rgb(hr, hg, hb, "~".repeat(this.width))}`,
+      `  ${" ".repeat(pad)}${bold(rgb(tr, tg, tb, title))}`,
+      `  ${rgb(hr, hg, hb, "~".repeat(this.width))}`,
+      "",
+    ].join("\n") + "\n";
+  }
+
+  private encodeRow(
+    intensities: Float32Array,
+    y: number,
+    colorFor: (x: number, y: number, i: number, w: number, h: number) => RGB
+  ): string {
+    const rowBase = y * this.width;
+    let out = "";
+    let active = false;
+    let cr = 0, cg = 0, cb = 0;
+
+    for (let x = 0; x < this.width; x++) {
+      const raw = sat(intensities[rowBase + x]);
+      const ch = charFor(raw);
+      const i = (Math.floor(raw * (RL - 1)) / RL);
+
+      if (ch === " " || ch === "`") {
+        if (active) {
+          out += "\x1b[0m";
+          active = false;
+        }
+        out += ch;
+        continue;
+      }
+
+      const [r, g, b] = colorFor(x, y, i, this.width, H);
+      if (!active || r !== cr || g !== cg || b !== cb) {
+        out += `\x1b[38;2;${r};${g};${b}m`;
+        cr = r;
+        cg = g;
+        cb = b;
+        active = true;
+      }
+      out += ch;
+    }
+
+    if (active) out += "\x1b[0m";
+    return out;
+  }
+
+  private shaderBlock(
+    intensities: Float32Array,
+    colorFor: (x: number, y: number, i: number, w: number, h: number) => RGB
+  ): string {
+    if (intensities.length !== this.width * H) {
+      throw new Error(`invalid frame buffer length: expected ${this.width * H}, got ${intensities.length}`);
+    }
+
+    let out = "";
+    for (let y = 0; y < H; y++) {
+      out += `  ${this.encodeRow(intensities, y, colorFor)}\n`;
+    }
+    return out;
+  }
+
+  private statusBlock(): string {
+    let out = "\n";
+    for (const line of this.statusLines) out += `${clr}  ${line}\n`;
+    for (let i = this.statusLines.length; i < 4; i++) out += `${clr}\n`;
+    return out;
+  }
+
+  private composeFrame(
+    intensities: Float32Array,
+    colorFor: (x: number, y: number, i: number, w: number, h: number) => RGB
+  ): string {
+    return this.headerBlock() + this.shaderBlock(intensities, colorFor) + this.statusBlock();
+  }
+
+  private writeFrame(frame: string) {
+    const moveUp = this.hasFrame ? up(this.frameRows) : "";
+    process.stdout.write(moveUp + frame);
+    this.hasFrame = true;
+  }
+
+  private requestRedraw() {
+    if (!this.started) return;
+    if (this.rendering) {
+      this.pendingRedraw = true;
+      return;
+    }
+    this.rendering = true;
+    try {
+      const intensities = this.preset.renderIntensity(this.t, this.width, H);
+      const frame = this.composeFrame(intensities, (x, y, i, w, h) =>
+        this.preset.colorFromIntensity(x, y, i, w, h)
+      );
+      this.writeFrame(frame);
+    } finally {
+      this.rendering = false;
+      if (this.pendingRedraw) {
+        this.pendingRedraw = false;
+        this.requestRedraw();
+      }
+    }
+  }
+
+  private teardown() {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = null;
+    }
+    process.stdout.off("resize", this.onResize);
   }
 
   start() {
     process.stdout.write(hide);
-    const title = `  ${this.modeTitle}  `;
-    const pad = Math.max(0, Math.floor((W - title.length) / 2));
-    const [hr, hg, hb] = this.preset.headerColor;
-    const [tr, tg, tb] = this.preset.titleColor;
-    process.stdout.write("\n");
-    process.stdout.write(`  ${rgb(hr, hg, hb, "~".repeat(W))}\n`);
-    process.stdout.write(`  ${" ".repeat(pad)}${bold(rgb(tr, tg, tb, title))}\n`);
-    process.stdout.write(`  ${rgb(hr, hg, hb, "~".repeat(W))}\n`);
-    process.stdout.write("\n");
+    this.width = getViewportWidth();
+    this.startMs = performance.now();
+    this.t = 0;
+    this.hasFrame = false;
     this.statusLines = [];
-    this._drawShader();
-    this._drawStatus();
     this.started = true;
-    this.interval = setInterval(() => { this.t += 0.08; this._redraw(); }, 50);
+    process.stdout.on("resize", this.onResize);
+    this.requestRedraw();
+    this.interval = setInterval(() => {
+      if (this.rendering) return;
+      this.t = ((performance.now() - this.startMs) / 1000) * 1.6;
+      this.requestRedraw();
+    }, 50);
   }
 
-  _drawShader() {
-    const lines = this.preset.render(this.t, W, H);
-    for (let y = 0; y < lines.length; y++) {
-      let out = "";
-      for (let x = 0; x < lines[y].length; x++) {
-        const ch = lines[y][x];
-        if (ch === " " || ch === "`") { out += ch; continue; }
-        const [r, g, b] = this.preset.color(x, y, ch, W, H);
-        out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
-      }
-      process.stdout.write(`  ${out}\n`);
-    }
+  setStatus(lines: string[]) {
+    this.statusLines = lines;
+    if (this.started) this.requestRedraw();
   }
-
-  _drawStatus() {
-    process.stdout.write("\n");
-    for (const line of this.statusLines) process.stdout.write(`${clr}  ${line}\n`);
-    for (let i = this.statusLines.length; i < 4; i++) process.stdout.write(`${clr}\n`);
-  }
-
-  _redraw() {
-    process.stdout.write(up(H + 6));
-    this._drawShader();
-    this._drawStatus();
-  }
-
-  setStatus(lines: string[]) { this.statusLines = lines; if (this.started) this._redraw(); }
 
   async finish(success: boolean) {
-    if (this.interval) clearInterval(this.interval);
+    this.teardown();
     if (success) {
       for (let i = 0; i < 30; i++) {
         this.t += 0.1;
-        process.stdout.write(up(H + 6));
-        const lines = successFrame(this.t, W, H);
-        for (let y = 0; y < lines.length; y++) {
-          let out = "";
-          for (let x = 0; x < lines[y].length; x++) {
-            const ch = lines[y][x];
-            if (ch === " " || ch === "`") { out += ch; continue; }
-            const [r, g, b] = this.preset.successColor(ch);
-            out += `\x1b[38;2;${r};${g};${b}m${ch}\x1b[0m`;
-          }
-          process.stdout.write(`  ${out}\n`);
-        }
-        this._drawStatus();
+        const intensities = successFrameIntensity(this.t, this.width, H);
+        const frame = this.composeFrame(intensities, (_x, _y, intensity) =>
+          this.preset.successColorFromIntensity(intensity)
+        );
+        this.writeFrame(frame);
         await sleep(45);
       }
     }
     process.stdout.write(show);
   }
 
-  stop() { if (this.interval) clearInterval(this.interval); process.stdout.write(show); }
+  stop() {
+    this.teardown();
+    process.stdout.write(show);
+  }
 }
 
 // -- helpers --
